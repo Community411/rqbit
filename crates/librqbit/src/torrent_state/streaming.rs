@@ -12,6 +12,7 @@ use std::{
 use anyhow::Context;
 use dashmap::DashMap;
 
+use librqbit_core::constants::CHUNK_SIZE;
 use librqbit_core::lengths::{CurrentPiece, Lengths, ValidPieceIndex};
 use tokio::{
     io::{AsyncRead, AsyncSeek},
@@ -25,8 +26,42 @@ use super::{ManagedTorrentHandle, TorrentMetadata};
 
 type StreamId = usize;
 
-// 32 mb lookahead by default.
+// 32 mb lookahead by default, overridable with RQBIT_STREAM_LOOKAHEAD_MB.
 const PER_STREAM_BUF_DEFAULT: u64 = 32 * 1024 * 1024;
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(v.trim(), "0" | "false" | "no" | ""),
+        Err(_) => default,
+    }
+}
+
+/// Serve chunks that are on disk but belong to a piece whose hash has not been
+/// checked yet. On by default in this build: it is what lets playback start on
+/// the first 16 KB rather than on a whole 2-8 MB piece. Set
+/// RQBIT_STREAM_SUBPIECE=0 to get the upstream behaviour back.
+static SUBPIECE_READS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| env_flag("RQBIT_STREAM_SUBPIECE", true));
+
+/// How much of a file's end holds the container index a player reads before
+/// it can open the file. Matroska Cues for a feature-length release measure
+/// tens of kilobytes; this is the window whose chunks the last piece is
+/// fetched from first.
+const TAIL_INDEX_BYTES: u64 = 256 * 1024;
+
+/// Fetch the last piece of a streamed file alongside the read head, for the
+/// container index players read before they can open the file.
+static TAIL_PRIORITY: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| env_flag("RQBIT_STREAM_TAIL_PRIORITY", true));
+
+static STREAM_LOOKAHEAD: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::env::var("RQBIT_STREAM_LOOKAHEAD_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|mb| *mb > 0)
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(PER_STREAM_BUF_DEFAULT)
+});
 
 struct StreamState {
     file_id: usize,
@@ -43,11 +78,32 @@ impl StreamState {
 
     fn queue<'a>(&self, lengths: &'a Lengths) -> impl Iterator<Item = ValidPieceIndex> + use<'a> {
         let start = self.file_abs_offset + self.position;
-        let end = (start + PER_STREAM_BUF_DEFAULT).min(self.file_abs_offset + self.file_len);
+        let end = (start + *STREAM_LOOKAHEAD).min(self.file_abs_offset + self.file_len);
         let dpl = lengths.default_piece_length();
-        let start_id = (start / dpl as u64).try_into().unwrap();
-        let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
-        (start_id..end_id).filter_map(|i| lengths.validate_piece_index(i))
+        let start_id: u32 = (start / dpl as u64).try_into().unwrap();
+        let end_id: u32 = end.div_ceil(dpl as u64).try_into().unwrap();
+        let empty = start_id >= end_id;
+
+        // The container index a player reads before it can report the file
+        // opened (Matroska Cues, a non-faststart MP4 moov) lives at the end of
+        // the file. Ask for that piece right after the one under the read head,
+        // so a second peer fetches it in parallel instead of after the whole
+        // 32 MB window. Without this the player's own tail request is what
+        // first puts the piece in a queue, and opening waits for it.
+        let tail_id = if empty || !*TAIL_PRIORITY || self.file_len == 0 {
+            None
+        } else {
+            let id = ((self.file_abs_offset + self.file_len - 1) / dpl as u64) as u32;
+            (id < start_id || id >= end_id).then_some(id)
+        };
+
+        let head = (!empty).then_some(start_id);
+        let rest_start = start_id.saturating_add(1);
+        let rest_end = if empty { rest_start } else { end_id };
+        head.into_iter()
+            .chain(tail_id)
+            .chain(rest_start..rest_end)
+            .filter_map(|i| lengths.validate_piece_index(i))
     }
 }
 
@@ -120,6 +176,52 @@ impl TorrentStreams {
         }
     }
 
+    /// Index, within [piece], of the chunk the earliest reader standing in
+    /// that piece is waiting for, when any reader is.
+    ///
+    /// A peer sends the chunks of a piece in index order, so a reader that
+    /// entered the piece anywhere but at its start waits for everything
+    /// before it: on an 8 MB piece a request for the last 64 KB waits for
+    /// 8 MB. That is what a player's index read at the end of the file is,
+    /// and what a seek landing mid-piece is. Requesting from the reader's
+    /// own chunk first turns both into one chunk of waiting.
+    pub(crate) fn first_wanted_chunk(
+        &self,
+        piece_id: ValidPieceIndex,
+        lengths: &Lengths,
+    ) -> Option<u32> {
+        let dpl = lengths.default_piece_length() as u64;
+        let chunk_of = |abs: u64| ((abs % dpl) / CHUNK_SIZE as u64) as u32;
+        let mut first: Option<u32> = None;
+        let mut tail: Option<u32> = None;
+        for s in self.streams.iter() {
+            let st = s.value();
+            if st.file_len == 0 {
+                continue;
+            }
+            if st.current_piece(lengths).map(|p| p.id) == Some(piece_id) {
+                let chunk = chunk_of(st.file_abs_offset + st.position);
+                first = Some(first.map_or(chunk, |c: u32| c.min(chunk)));
+                continue;
+            }
+            // No reader stands here, but this is the last piece of a file
+            // being streamed, which the queue asks for early precisely
+            // because the container index lives at its end. Nothing would
+            // otherwise stop a peer from starting that piece at its first
+            // chunk and delivering the index last.
+            let last_byte = st.file_abs_offset + st.file_len - 1;
+            if (last_byte / dpl) as u32 != piece_id.get() {
+                continue;
+            }
+            let window_start = last_byte
+                .saturating_sub(TAIL_INDEX_BYTES - 1)
+                .max(st.file_abs_offset);
+            let chunk = chunk_of(window_start);
+            tail = Some(tail.map_or(chunk, |c: u32| c.min(chunk)));
+        }
+        first.or(tail).filter(|c| *c > 0)
+    }
+
     fn drop_stream(&self, stream_id: StreamId) -> Option<StreamState> {
         debug!(stream_id, "dropping stream");
         self.streams.remove(&stream_id).map(|s| s.1)
@@ -141,6 +243,9 @@ pub struct FileStream {
     // file params
     file_len: u64,
     file_torrent_abs_offset: u64,
+
+    // Serve chunks already on disk inside a piece that is not verified yet.
+    subpiece_reads: bool,
 
     _blocking_permit: OwnedSemaphorePermit,
 }
@@ -187,17 +292,32 @@ impl AsyncRead for FileStream {
                 .context("invalid position")
         );
 
-        // if the piece is not there, register to wake when it is
-        // check if we have the piece for real
-        let have = poll_try_io!(self.torrent.with_chunk_tracker(|ct| {
-            let have = ct.get_have_pieces().as_slice()[current.id.get() as usize];
-            if !have {
+        // How many bytes we may serve from the current position.
+        //
+        // With the whole piece verified, that is the rest of the piece. Without
+        // it, and only when sub-piece streaming is on, it is the run of chunks
+        // already written to disk under the read head: the bytes a player needs
+        // to start are the first few kilobytes of a 2-8 MB piece, and waiting
+        // for the whole piece (from the single peer that owns it) is what makes
+        // playback start slow.
+        let abs_pos = self.file_torrent_abs_offset + self.position;
+        let subpiece = self.subpiece_reads;
+        let available = poll_try_io!(self.torrent.with_chunk_tracker(|ct| {
+            let mut available = if ct.get_have_pieces().as_slice()[current.id.get() as usize] {
+                current.piece_remaining as u64
+            } else if subpiece {
+                ct.contiguous_downloaded_bytes_at(abs_pos)
+            } else {
+                0
+            };
+            available = available.min(current.piece_remaining as u64);
+            if available == 0 {
                 self.streams
                     .register_waker(self.stream_id, cx.waker().clone());
             }
-            have
+            available
         }));
-        if !have {
+        if available == 0 {
             debug!(stream_id = self.stream_id, file_id = self.file_id, piece_id = %current.id, "poll pending, not have");
             return Poll::Pending;
         }
@@ -207,7 +327,7 @@ impl AsyncRead for FileStream {
         let file_remaining = self.file_len - self.position;
         let bytes_to_read: usize = poll_try_io!(
             (buf.len() as u64)
-                .min(current.piece_remaining as u64)
+                .min(available)
                 .min(file_remaining)
                 .try_into()
         );
@@ -264,6 +384,9 @@ impl AsyncSeek for FileStream {
 
         self.as_mut().set_position(map_io_err!(new_pos.try_into())?);
         debug!(stream_id = self.stream_id, position = self.position, "seek");
+        // The window this stream asks for just moved. Peers parked on the 5 s
+        // "no pieces to request" timer would otherwise discover it that late.
+        self.torrent.notify_new_pieces_available();
         Ok(())
     }
 
@@ -323,6 +446,16 @@ impl ManagedTorrent {
         true
     }
 
+    /// Wake every peer parked waiting for something to request. Called when a
+    /// stream opens or moves, since both change what the torrent needs next.
+    pub(crate) fn notify_new_pieces_available(&self) {
+        self.with_state(|state| {
+            if let crate::ManagedTorrentState::Live(l) = &state {
+                l.notify_new_pieces_available();
+            }
+        });
+    }
+
     fn is_file_finished(&self, file_id: usize) -> bool {
         let metadata = self.metadata.load();
         let metadata = match metadata.as_ref() {
@@ -354,6 +487,7 @@ impl ManagedTorrent {
 
             file_len: fd_len,
             file_torrent_abs_offset: fd_offset,
+            subpiece_reads: *SUBPIECE_READS,
             _blocking_permit: blocking_permit,
             torrent: self,
             metadata,
@@ -371,6 +505,7 @@ impl ManagedTorrent {
         );
 
         debug!(stream_id = s.stream_id, file_id, "started stream");
+        s.torrent.notify_new_pieces_available();
 
         Ok(s)
     }

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::Context;
 use buffers::ByteBuf;
+use librqbit_core::constants::CHUNK_SIZE;
 use librqbit_core::lengths::{ChunkInfo, Lengths, ValidPieceIndex};
 use peer_binary_protocol::Piece;
 use tracing::{debug, trace};
@@ -279,6 +280,46 @@ impl ChunkTracker {
                 self.hns.needed_bytes -= len;
             }
         }
+    }
+
+    /// How many contiguous bytes are readable from disk starting at
+    /// `abs_offset`, without leaving the piece that offset falls in.
+    ///
+    /// A set bit in `chunk_status` is written after the chunk itself reached
+    /// the file (write_chunk runs before mark_chunk_downloaded, both under the
+    /// same lock discipline), so a set bit means the bytes are there. They are
+    /// NOT hash-verified: only the streaming read path may use this, never the
+    /// `have` bitfield peers see nor the upload path.
+    pub fn contiguous_downloaded_bytes_at(&self, abs_offset: u64) -> u64 {
+        let dpl = self.lengths.default_piece_length() as u64;
+        let piece_id = match u32::try_from(abs_offset / dpl)
+            .ok()
+            .and_then(|id| self.lengths.validate_piece_index(id))
+        {
+            Some(p) => p,
+            None => return 0,
+        };
+        let piece_len = self.lengths.piece_length(piece_id) as u64;
+        let offset_in_piece = abs_offset % dpl;
+        if offset_in_piece >= piece_len {
+            return 0;
+        }
+        let chunk_size = CHUNK_SIZE as u64;
+        let first_chunk = (offset_in_piece / chunk_size) as usize;
+        let range = self.lengths.chunk_range(piece_id);
+        let bits = match self.chunk_status.get(range) {
+            Some(b) => b,
+            None => return 0,
+        };
+        if first_chunk >= bits.len() || !bits[first_chunk] {
+            return 0;
+        }
+        let mut last = first_chunk;
+        while last + 1 < bits.len() && bits[last + 1] {
+            last += 1;
+        }
+        let end_in_piece = (((last + 1) as u64) * chunk_size).min(piece_len);
+        end_in_piece.saturating_sub(offset_in_piece)
     }
 
     pub fn is_chunk_ready_to_upload(&self, chunk: &ChunkInfo) -> bool {

@@ -172,6 +172,31 @@ impl TorrentStateLocked {
 
 const FLUSH_BITV_EVERY_BYTES: u64 = 16 * 1024 * 1024;
 
+/// The chunks of [piece], in the order to request them from one peer.
+///
+/// Natural order, unless a reader is standing at [first_wanted], in which
+/// case the burst starts there and wraps around to the chunks before it.
+/// Every chunk is still requested exactly once.
+fn order_chunks_for_readers(
+    lengths: &Lengths,
+    piece: ValidPieceIndex,
+    first_wanted: Option<u32>,
+) -> Vec<ChunkInfo> {
+    let mut chunks: Vec<ChunkInfo> = lengths.iter_chunk_infos(piece).collect();
+    if let Some(k) = first_wanted
+        && (k as usize) < chunks.len()
+    {
+        debug!(
+            piece = piece.get(),
+            first_chunk = k,
+            total = chunks.len(),
+            "requesting piece from the reader's chunk"
+        );
+        chunks.rotate_left(k as usize);
+    }
+    chunks
+}
+
 pub enum AddIncomingPeerResult {
     Added,
     AlreadyActive,
@@ -895,6 +920,13 @@ impl TorrentStateLive {
                     .send(WriterRequest::Disconnect(Ok(())));
             }
         }
+    }
+
+    /// Wake the peers parked in the requester loop's "no pieces to request"
+    /// wait. Opening or moving a stream changes the priority window, and
+    /// without this they would only notice on the next 5 s tick.
+    pub(crate) fn notify_new_pieces_available(&self) {
+        self.new_pieces_notify.notify_waiters();
     }
 
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
@@ -1684,7 +1716,17 @@ impl PeerHandler {
                 }
             };
 
-            for chunk in self.state.lengths.iter_chunk_infos(next) {
+            // Order the chunks of this piece so a reader standing inside it
+            // gets what it is blocked on first. Everything before the read
+            // head is still requested, at the end of the same burst, because
+            // the piece only completes and passes its hash check once it is
+            // whole.
+            let chunks = order_chunks_for_readers(
+                &self.state.lengths,
+                next,
+                self.state.streams.first_wanted_chunk(next, &self.state.lengths),
+            );
+            for chunk in chunks {
                 let request = Request {
                     index: next.get(),
                     begin: chunk.offset,
@@ -1896,7 +1938,16 @@ impl PeerHandler {
                         debug!("piece={} was done by someone else, ignoring", piece.index);
                         return Ok(());
                     }
-                    Some(ChunkMarkingResult::NotCompleted) => None,
+                    Some(ChunkMarkingResult::NotCompleted) => {
+                        // A reader parked inside this piece can move on now:
+                        // the chunk is on disk and marked. Only streams sitting
+                        // on this very piece hold a waker, so this is a no-op
+                        // for every other chunk in flight.
+                        state
+                            .streams
+                            .wake_streams_on_piece_completed(chunk_info.piece_index, &state.lengths);
+                        None
+                    }
                     None => {
                         anyhow::bail!(
                             "bogus data received: {:?}, cannot map this to a chunk, dropping peer",
