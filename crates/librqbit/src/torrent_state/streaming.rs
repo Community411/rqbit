@@ -111,11 +111,21 @@ impl StreamState {
 pub(crate) struct TorrentStreams {
     next_stream_id: AtomicUsize,
     streams: DashMap<StreamId, StreamState>,
+    /// How many streams are registered. Read before touching the map: the
+    /// wake path runs once per chunk written, on every torrent, and
+    /// iterating a DashMap locks every shard (128 of them on a 24-core
+    /// host) even when it is empty. A torrent nobody streams must pay one
+    /// atomic load and nothing else.
+    live_streams: AtomicUsize,
 }
 
 impl TorrentStreams {
     fn next_id(&self) -> usize {
         self.next_stream_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn has_streams(&self) -> bool {
+        self.live_streams.load(Ordering::Relaxed) > 0
     }
 
     fn register_waker(&self, stream_id: StreamId, waker: Waker) {
@@ -162,6 +172,9 @@ impl TorrentStreams {
         piece_id: ValidPieceIndex,
         lengths: &Lengths,
     ) {
+        if !self.has_streams() {
+            return;
+        }
         for mut w in self.streams.iter_mut() {
             if w.value().current_piece(lengths).map(|p| p.id) == Some(piece_id)
                 && let Some(waker) = w.value_mut().waker.take()
@@ -190,6 +203,9 @@ impl TorrentStreams {
         piece_id: ValidPieceIndex,
         lengths: &Lengths,
     ) -> Option<u32> {
+        if !self.has_streams() {
+            return None;
+        }
         let dpl = lengths.default_piece_length() as u64;
         let chunk_of = |abs: u64| ((abs % dpl) / CHUNK_SIZE as u64) as u32;
         let mut first: Option<u32> = None;
@@ -213,9 +229,14 @@ impl TorrentStreams {
             if (last_byte / dpl) as u32 != piece_id.get() {
                 continue;
             }
+            // Clamp to this piece: a file whose last bytes sit just inside
+            // the piece would otherwise put the window in the piece before
+            // it, and the chunk index computed there means nothing here.
+            let piece_start = (last_byte / dpl) * dpl;
             let window_start = last_byte
                 .saturating_sub(TAIL_INDEX_BYTES - 1)
-                .max(st.file_abs_offset);
+                .max(st.file_abs_offset)
+                .max(piece_start);
             let chunk = chunk_of(window_start);
             tail = Some(tail.map_or(chunk, |c: u32| c.min(chunk)));
         }
@@ -224,7 +245,11 @@ impl TorrentStreams {
 
     fn drop_stream(&self, stream_id: StreamId) -> Option<StreamState> {
         debug!(stream_id, "dropping stream");
-        self.streams.remove(&stream_id).map(|s| s.1)
+        let removed = self.streams.remove(&stream_id).map(|s| s.1);
+        if removed.is_some() {
+            self.live_streams.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed
     }
 
     pub(crate) fn streamed_file_ids(&self) -> impl Iterator<Item = usize> + '_ {
@@ -503,6 +528,7 @@ impl ManagedTorrent {
                 file_abs_offset: fd_offset,
             },
         );
+        streams.live_streams.fetch_add(1, Ordering::Relaxed);
 
         debug!(stream_id = s.stream_id, file_id, "started stream");
         s.torrent.notify_new_pieces_available();

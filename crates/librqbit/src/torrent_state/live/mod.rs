@@ -1938,16 +1938,7 @@ impl PeerHandler {
                         debug!("piece={} was done by someone else, ignoring", piece.index);
                         return Ok(());
                     }
-                    Some(ChunkMarkingResult::NotCompleted) => {
-                        // A reader parked inside this piece can move on now:
-                        // the chunk is on disk and marked. Only streams sitting
-                        // on this very piece hold a waker, so this is a no-op
-                        // for every other chunk in flight.
-                        state
-                            .streams
-                            .wake_streams_on_piece_completed(chunk_info.piece_index, &state.lengths);
-                        None
-                    }
+                    Some(ChunkMarkingResult::NotCompleted) => None,
                     None => {
                         anyhow::bail!(
                             "bogus data received: {:?}, cannot map this to a chunk, dropping peer",
@@ -1956,6 +1947,17 @@ impl PeerHandler {
                     }
                 }
             };
+
+            // A reader parked inside this piece can move on now: the chunk
+            // is on disk and marked. Outside the write lock the wake was
+            // taken under, since waking runs the reader, and it wakes on a
+            // completed piece too rather than making a reader parked on the
+            // last chunk wait out the hash check below. Streams sitting on
+            // another piece hold no waker for this one, and a torrent with
+            // no stream at all pays one atomic load.
+            state
+                .streams
+                .wake_streams_on_piece_completed(chunk_info.piece_index, &state.lengths);
 
             // We don't care about per piece lock anymore, as it's removed from inflight pieces.
             // It shouldn't impact perf anyway, but dropping just in case.

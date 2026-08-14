@@ -554,6 +554,65 @@ mod tests {
     }
 
     #[test]
+    fn test_contiguous_downloaded_bytes_at() {
+        // Deliberately hostile lengths: the last chunk of every piece is
+        // short, and so is the last piece.
+        let piece_len = CHUNK_SIZE * 2 + 1;
+        let total_len = piece_len as u64 * 2 + 1;
+        let l = Lengths::new(total_len, piece_len).unwrap();
+        assert_eq!(l.total_pieces(), 3);
+        assert_eq!(l.default_chunks_per_piece(), 3);
+        assert_eq!(l.total_chunks(), 7);
+
+        let bf_len = l.piece_bitfield_bytes();
+        let have = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+        let selected = {
+            let mut bf = BF::from_boxed_slice(vec![0u8; bf_len].into_boxed_slice());
+            bf.get_mut(0..3).unwrap().fill(true);
+            bf
+        };
+        let mut ct =
+            ChunkTracker::new(have.into_dyn(), selected, l, &Default::default()).unwrap();
+
+        // Nothing downloaded: nothing readable, anywhere.
+        assert_eq!(ct.contiguous_downloaded_bytes_at(0), 0);
+        assert_eq!(ct.contiguous_downloaded_bytes_at(CHUNK_SIZE as u64), 0);
+
+        // First chunk of piece 0 only.
+        ct.chunk_status.set(0, true);
+        assert_eq!(ct.contiguous_downloaded_bytes_at(0), CHUNK_SIZE as u64);
+        // Half way into it, the rest of that chunk is readable.
+        assert_eq!(
+            ct.contiguous_downloaded_bytes_at(1000),
+            CHUNK_SIZE as u64 - 1000
+        );
+        // The chunk after it is missing, so the run stops there.
+        assert_eq!(ct.contiguous_downloaded_bytes_at(CHUNK_SIZE as u64), 0);
+
+        // Second chunk too: the run covers both, and stops at the end of
+        // the piece even though the third chunk is the short one.
+        ct.chunk_status.set(1, true);
+        assert_eq!(ct.contiguous_downloaded_bytes_at(0), 2 * CHUNK_SIZE as u64);
+        ct.chunk_status.set(2, true);
+        assert_eq!(ct.contiguous_downloaded_bytes_at(0), piece_len as u64);
+        // Never past the piece, even with the next piece fully present.
+        ct.chunk_status.set(3, true);
+        ct.chunk_status.set(4, true);
+        ct.chunk_status.set(5, true);
+        assert_eq!(ct.contiguous_downloaded_bytes_at(0), piece_len as u64);
+
+        // The short last piece: one byte, one chunk.
+        let last_start = piece_len as u64 * 2;
+        assert_eq!(ct.contiguous_downloaded_bytes_at(last_start), 0);
+        ct.chunk_status.set(6, true);
+        assert_eq!(ct.contiguous_downloaded_bytes_at(last_start), 1);
+
+        // Past the end of the torrent.
+        assert_eq!(ct.contiguous_downloaded_bytes_at(total_len), 0);
+        assert_eq!(ct.contiguous_downloaded_bytes_at(total_len + 1000), 0);
+    }
+
+    #[test]
     fn test_update_only_files() {
         let piece_len = CHUNK_SIZE * 2 + 1;
         let total_len = piece_len as u64 * 2 + 1;
