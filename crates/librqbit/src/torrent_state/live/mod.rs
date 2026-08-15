@@ -893,6 +893,10 @@ impl TorrentStateLive {
             if chunks.get_selected_pieces()[id.get_usize()] {
                 locked.try_flush_bitv(&self.shared, false);
                 info!(id=self.shared.id, info_hash=?self.shared.info_hash, "torrent finished downloading");
+                // Announce the completion now rather than at the next
+                // scheduled announce: a tracker counts a snatch on the
+                // "completed" event, and the next one can be half an hour off.
+                self.shared.reannounce();
             }
             self.finished_notify.notify_waiters();
 
@@ -1724,7 +1728,9 @@ impl PeerHandler {
             let chunks = order_chunks_for_readers(
                 &self.state.lengths,
                 next,
-                self.state.streams.first_wanted_chunk(next, &self.state.lengths),
+                self.state
+                    .streams
+                    .first_wanted_chunk(next, &self.state.lengths),
             );
             for chunk in chunks {
                 let request = Request {

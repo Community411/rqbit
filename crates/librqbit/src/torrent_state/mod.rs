@@ -36,6 +36,8 @@ use tracing::debug;
 use tracing::debug_span;
 use tracing::trace;
 use tracing::warn;
+use tracker_comms::TrackerComms;
+use tracker_comms::TrackerStatus;
 
 use crate::Session;
 use crate::chunk_tracker::ChunkTracker;
@@ -178,11 +180,19 @@ impl TorrentMetadata {
 // The reason it's not inlined into ManagedTorrent is to break the Arc cycle:
 // ManagedTorrent contains the current torrent state, which in turn needs access to a bunch
 // of stuff, but it shouldn't access the state.
+/// Where the announce tasks of the current session publish their handle.
+///
+/// A new one lands here every time the torrent goes live, since the announce
+/// tasks are created with the peer stream and die with it, and the slot is
+/// empty until the first one.
+pub(crate) type TrackerCommsSlot = ArcSwapOption<TrackerComms>;
+
 pub struct ManagedTorrentShared {
     pub id: TorrentId,
     pub info_hash: Id20,
     pub(crate) spawner: BlockingSpawner,
     pub trackers: HashSet<url::Url>,
+    pub(crate) tracker_comms: Arc<TrackerCommsSlot>,
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
@@ -199,6 +209,14 @@ pub struct ManagedTorrentShared {
 impl ManagedTorrentShared {
     pub(crate) fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
+    }
+
+    /// Ask the announce tasks to announce now. A no-op while the torrent is
+    /// not announcing.
+    pub(crate) fn reannounce(&self) {
+        if let Some(comms) = self.tracker_comms.load_full() {
+            comms.reannounce();
+        }
     }
 }
 
@@ -247,6 +265,32 @@ impl ManagedTorrent {
 
     pub fn info_hash(&self) -> Id20 {
         self.shared.info_hash
+    }
+
+    /// The state of every tracker of this torrent, as of the last announce.
+    /// Empty while the torrent never announced.
+    pub fn tracker_statuses(&self) -> Vec<TrackerStatus> {
+        self.shared
+            .tracker_comms
+            .load_full()
+            .map(|c| c.tracker_statuses())
+            .unwrap_or_default()
+    }
+
+    /// Announce now instead of waiting for the next scheduled announce.
+    pub fn reannounce(&self) {
+        self.shared.reannounce();
+    }
+
+    /// Announce `stopped` to the trackers, once, giving up after `deadline`.
+    ///
+    /// Best effort by construction: the announce tasks are gone by the time a
+    /// torrent is paused, and a tracker that does not answer within the
+    /// deadline is left to time the peer out on its own.
+    pub async fn announce_stopped(&self, deadline: Duration) {
+        if let Some(comms) = self.shared.tracker_comms.load_full() {
+            comms.announce_stopped(deadline).await;
+        }
     }
 
     pub fn only_files(&self) -> Option<Vec<usize>> {

@@ -36,7 +36,8 @@ use crate::{
     },
     torrent_state::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
-        TorrentMetadata, TorrentStateLive, initializing::TorrentStateInitializing,
+        TorrentMetadata, TorrentStateLive, TrackerCommsSlot,
+        initializing::TorrentStateInitializing,
     },
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
 };
@@ -80,6 +81,10 @@ struct ParsedTorrentFile {
     meta: TorrentMetaV1Owned,
     torrent_bytes: Bytes,
 }
+
+/// How long a "stopped" announce may take before the torrent is let go. Short
+/// on purpose: it runs on the shutdown path and on every pause.
+const STOPPED_ANNOUNCE_DEADLINE: Duration = Duration::from_secs(3);
 
 fn torrent_from_bytes(bytes: Bytes) -> anyhow::Result<ParsedTorrentFile> {
     trace!(
@@ -1064,11 +1069,20 @@ impl Session {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        for torrent in torrents {
+        for torrent in &torrents {
             if let Err(e) = torrent.pause() {
                 debug!("error pausing torrent: {e:#}");
             }
         }
+        // Tell the trackers we are leaving before the tasks are cancelled: a
+        // "stopped" that is never sent leaves this peer advertised until the
+        // tracker times it out, which is much longer than this wait.
+        futures::future::join_all(
+            torrents
+                .iter()
+                .map(|t| t.announce_stopped(STOPPED_ANNOUNCE_DEADLINE)),
+        )
+        .await;
         self.cancellation_token.cancel();
         // this sucks, but hopefully will be enough
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1229,6 +1243,7 @@ impl Session {
 
         let private = metadata.as_ref().is_some_and(|m| m.info.info().private);
 
+        let tracker_comms_slot: Arc<TrackerCommsSlot> = Default::default();
         let make_peer_rx = || {
             self.make_peer_rx(
                 info_hash,
@@ -1237,6 +1252,7 @@ impl Session {
                 opts.force_tracker_interval,
                 opts.initial_peers.clone().unwrap_or_default(),
                 private,
+                &tracker_comms_slot,
             )
         };
 
@@ -1344,6 +1360,7 @@ impl Session {
                 info_hash,
                 trackers: trackers.into_iter().collect(),
                 spawner: self.spawner.clone(),
+                tracker_comms: tracker_comms_slot.clone(),
                 peer_id: self.peer_id,
                 storage_factory,
                 options: ManagedTorrentOptions {
@@ -1447,6 +1464,7 @@ impl Session {
         if let Err(e) = removed.pause() {
             debug!("error pausing torrent before deletion: {e:#}")
         }
+        removed.announce_stopped(STOPPED_ANNOUNCE_DEADLINE).await;
 
         let metadata = removed.metadata.load_full().expect("TODO");
 
@@ -1521,10 +1539,12 @@ impl Session {
             t.shared().options.force_tracker_interval,
             t.shared().options.initial_peers.clone(),
             is_private,
+            &t.shared().tracker_comms,
         )
     }
 
     // Get a peer stream from both DHT and trackers.
+    #[allow(clippy::too_many_arguments)]
     fn make_peer_rx(
         self: &Arc<Self>,
         info_hash: Id20,
@@ -1533,6 +1553,7 @@ impl Session {
         force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
         is_private: bool,
+        tracker_comms_slot: &TrackerCommsSlot,
     ) -> Option<PeerStream> {
         let dht_rx = if is_private {
             None
@@ -1577,7 +1598,13 @@ impl Session {
             self.announce_port().unwrap_or(4240),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
-        );
+        )
+        .map(|(peer_rx, comms)| {
+            // The handle outlives this call so that a pause, a shutdown or a
+            // forced reannounce can reach the announce tasks of this session.
+            tracker_comms_slot.store(Some(comms));
+            peer_rx
+        });
 
         let initial_peers_rx = if initial_peers.is_empty() {
             None
@@ -1603,6 +1630,7 @@ impl Session {
 
     pub async fn pause(&self, handle: &ManagedTorrentHandle) -> anyhow::Result<()> {
         handle.pause()?;
+        handle.announce_stopped(STOPPED_ANNOUNCE_DEADLINE).await;
         self.try_update_persistence_metadata(handle).await;
         Ok(())
     }

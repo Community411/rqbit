@@ -13,12 +13,10 @@ use librqbit_core::{
     hash_id::Id20,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackerRequestEvent {
     Started,
-    #[allow(dead_code)]
     Stopped,
-    #[allow(dead_code)]
     Completed,
 }
 
@@ -134,21 +132,20 @@ where
 
 #[derive(Deserialize, Debug)]
 pub struct TrackerResponse<'a> {
-    #[allow(dead_code)]
     #[serde(rename = "warning message", borrow)]
     pub warning_message: Option<ByteBuf<'a>>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub complete: u64,
+    /// Seeders, when the tracker counts them.
+    pub complete: Option<u64>,
     pub interval: u64,
-    #[allow(dead_code)]
     #[serde(rename = "min interval")]
     pub min_interval: Option<u64>,
     #[allow(dead_code)]
     pub tracker_id: Option<ByteBuf<'a>>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub incomplete: u64,
+    /// Leechers, when the tracker counts them.
+    pub incomplete: Option<u64>,
+    /// Times the tracker saw this torrent completed. Not in BEP-3; most
+    /// tracker software sends it and the field stays optional.
+    pub downloaded: Option<u64>,
     #[serde(borrow)]
     pub peers: Peers<'a, SocketAddrV4>,
     #[serde(default, borrow)]
