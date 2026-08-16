@@ -74,7 +74,16 @@ pub enum TrackerCommsStatsState {
 #[derive(Default)]
 pub struct TrackerCommsStats {
     pub uploaded_bytes: u64,
+    /// Bytes actually fetched from peers this session: the announce
+    /// `downloaded` value. Bytes verified on disk do not belong here: a hash
+    /// check of preexisting data downloads nothing, and announcing it as
+    /// `downloaded` charges the account for a transfer that never happened
+    /// on a ratio-enforcing tracker.
     pub downloaded_bytes: u64,
+    /// Bytes verified on disk. Drives `left` (BEP-3 wants remaining bytes,
+    /// which fetched bytes are wrong for whenever data preexists) and the
+    /// completion transition, never the `downloaded` value.
+    pub progress_bytes: u64,
     pub total_bytes: u64,
     pub torrent_state: TrackerCommsStatsState,
 }
@@ -82,15 +91,15 @@ pub struct TrackerCommsStats {
 impl TrackerCommsStats {
     pub fn get_left_to_download_bytes(&self) -> u64 {
         let total = self.total_bytes;
-        let down = self.downloaded_bytes;
-        if total >= down {
-            return total - down;
+        let progress = self.progress_bytes;
+        if total >= progress {
+            return total - progress;
         }
         0
     }
 
     pub fn is_completed(&self) -> bool {
-        self.downloaded_bytes >= self.total_bytes
+        self.progress_bytes >= self.total_bytes
     }
 }
 

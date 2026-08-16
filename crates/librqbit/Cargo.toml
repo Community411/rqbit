@@ -119,6 +119,9 @@ anyhow.workspace = true
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
+# The fake HTTP tracker the announce tests of tracker_comms drive, reused
+# here so the session-level announce tests assert against the same harness.
+tracker_comms = { workspace = true, features = ["test-support"] }
 tokio-test.workspace = true
 tempfile.workspace = true
 pollster.workspace = true

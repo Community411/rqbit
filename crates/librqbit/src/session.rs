@@ -1819,7 +1819,18 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
         use tracker_comms::TrackerCommsStatsState as S;
 
         tracker_comms::TrackerCommsStats {
-            downloaded_bytes: stats.progress_bytes,
+            // The announce `downloaded` is the bytes fetched from peers this
+            // session, not the bytes verified on disk: a torrent added with
+            // its data already present verifies everything and has fetched
+            // nothing. Outside the live state no transfer is running and the
+            // per-torrent transfer counters do not exist, so zero is the
+            // honest value there.
+            downloaded_bytes: stats
+                .live
+                .as_ref()
+                .map(|l| l.snapshot.fetched_bytes)
+                .unwrap_or(0),
+            progress_bytes: stats.progress_bytes,
             total_bytes: stats.total_bytes,
             uploaded_bytes: stats.uploaded_bytes,
             torrent_state: match stats.state {

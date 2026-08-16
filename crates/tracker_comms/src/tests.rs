@@ -1,235 +1,71 @@
-//! Announce behaviour against a fake HTTP tracker.
-//!
-//! The tracker is a plain TCP listener speaking just enough HTTP/1.1 to record
-//! every announce and answer a scripted reply, which is what lets these tests
-//! assert what goes on the wire (the event, `left`) rather than what the code
-//! meant to send.
+//! Announce behaviour against the fake HTTP tracker of `test_support`,
+//! which records every announce and answers a scripted reply: these tests
+//! assert what goes on the wire (the event, `left`, `downloaded`) rather
+//! than what the code meant to send.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 
 use parking_lot::Mutex;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::TrackerComms;
 use crate::TrackerState;
 use crate::UdpTrackerClient;
+use crate::test_support::{FakeTracker, Reply, body_empty, body_failure, body_one_peer};
 use crate::tracker_comms::TorrentStatsProvider;
 use crate::tracker_comms::TrackerCommsStats;
 
-/// One recorded announce, as the tracker saw it.
-#[derive(Clone, Debug)]
-struct Announce {
-    query: HashMap<String, String>,
-    at: Instant,
-}
-
-impl Announce {
-    fn event(&self) -> Option<&str> {
-        self.query.get("event").map(|s| s.as_str())
-    }
-
-    fn left(&self) -> u64 {
-        self.query
-            .get("left")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_default()
-    }
-}
-
-/// What the fake tracker answers to one announce.
-struct Reply {
-    status: &'static str,
-    headers: Vec<(&'static str, String)>,
-    body: Vec<u8>,
-}
-
-impl Reply {
-    fn ok(body: impl Into<Vec<u8>>) -> Self {
-        Self {
-            status: "200 OK",
-            headers: Vec::new(),
-            body: body.into(),
-        }
-    }
-
-    fn status(status: &'static str) -> Self {
-        Self {
-            status,
-            headers: Vec::new(),
-            body: Vec::new(),
-        }
-    }
-
-    fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
-        self.headers.push((name, value.into()));
-        self
-    }
-}
-
-/// A bencoded answer with no peers and the given intervals.
-fn body_empty(interval: u64, min_interval: Option<u64>) -> Vec<u8> {
-    let mut s = format!("d8:completei3e10:downloadedi7e10:incompletei1e8:intervali{interval}e");
-    if let Some(m) = min_interval {
-        s.push_str(&format!("12:min intervali{m}e"));
-    }
-    s.push_str("5:peers0:e");
-    s.into_bytes()
-}
-
-/// A bencoded answer carrying one compact peer, 127.0.0.1:6881.
-fn body_one_peer(interval: u64) -> Vec<u8> {
-    let mut v =
-        format!("d8:completei3e10:incompletei1e8:intervali{interval}e5:peers6:").into_bytes();
-    v.extend_from_slice(&[127, 0, 0, 1, 0x1a, 0xe1]);
-    v.extend_from_slice(b"e");
-    v
-}
-
-fn body_failure(reason: &str) -> Vec<u8> {
-    format!("d14:failure reason{}:{}e", reason.len(), reason).into_bytes()
-}
-
-struct FakeTracker {
-    url: Url,
-    announces: Arc<Mutex<Vec<Announce>>>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for FakeTracker {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-impl FakeTracker {
-    /// `reply` is called with the zero-based index of the announce.
-    async fn start(reply: impl Fn(usize) -> Reply + Send + Sync + 'static) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        // A path and a query of its own: the announce URL of a private tracker
-        // carries the passkey there, and the client must preserve both.
-        let url = Url::parse(&format!("http://{addr}/announce/passkey?tid=7")).unwrap();
-        let announces = Arc::new(Mutex::new(Vec::new()));
-
-        let task = tokio::spawn({
-            let announces = announces.clone();
-            async move {
-                loop {
-                    let (mut sock, _) = match listener.accept().await {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 1024];
-                    // The request has no body, so the head is the whole of it.
-                    let target = loop {
-                        let n = match sock.read(&mut chunk).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => n,
-                        };
-                        buf.extend_from_slice(&chunk[..n]);
-                        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            let head = String::from_utf8_lossy(&buf[..end]).to_string();
-                            break head.split_whitespace().nth(1).unwrap_or("").to_string();
-                        }
-                    };
-
-                    let query = target
-                        .split_once('?')
-                        .map(|(_, q)| q)
-                        .unwrap_or("")
-                        .split('&')
-                        .filter_map(|kv| kv.split_once('='))
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .collect::<HashMap<_, _>>();
-
-                    let index = {
-                        let mut g = announces.lock();
-                        g.push(Announce {
-                            query,
-                            at: Instant::now(),
-                        });
-                        g.len() - 1
-                    };
-
-                    let reply = reply(index);
-                    let mut out = format!(
-                        "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-                        reply.status,
-                        reply.body.len()
-                    );
-                    for (name, value) in &reply.headers {
-                        out.push_str(&format!("{name}: {value}\r\n"));
-                    }
-                    out.push_str("\r\n");
-                    let mut out = out.into_bytes();
-                    out.extend_from_slice(&reply.body);
-                    let _ = sock.write_all(&out).await;
-                    let _ = sock.flush().await;
-                }
-            }
-        });
-
-        Self {
-            url,
-            announces,
-            task,
-        }
-    }
-
-    fn announces(&self) -> Vec<Announce> {
-        self.announces.lock().clone()
-    }
-
-    fn count(&self) -> usize {
-        self.announces.lock().len()
-    }
-
-    async fn wait_for(&self, n: usize, within: Duration) {
-        let deadline = Instant::now() + within;
-        while self.count() < n {
-            assert!(
-                Instant::now() < deadline,
-                "only {} announces after {within:?}, wanted {n}",
-                self.count()
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-}
-
-/// A stats provider the test drives.
+/// A stats provider the test drives. `progress` is the verified bytes on
+/// disk (drives `left` and the completion transition), `fetched` the bytes
+/// fetched from peers (the announce `downloaded`): the two move separately
+/// on purpose, a torrent whose data preexists verifies without fetching.
 #[derive(Clone, Default)]
 struct FakeStats {
-    inner: Arc<Mutex<(u64, u64)>>,
+    inner: Arc<Mutex<FakeStatsInner>>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct FakeStatsInner {
+    total: u64,
+    progress: u64,
+    fetched: u64,
+    uploaded: u64,
 }
 
 impl FakeStats {
-    fn new(total: u64, downloaded: u64) -> Self {
+    fn new(total: u64, progress: u64) -> Self {
         Self {
-            inner: Arc::new(Mutex::new((total, downloaded))),
+            inner: Arc::new(Mutex::new(FakeStatsInner {
+                total,
+                progress,
+                ..Default::default()
+            })),
         }
     }
 
-    fn set_downloaded(&self, downloaded: u64) {
-        self.inner.lock().1 = downloaded;
+    fn set_progress(&self, progress: u64) {
+        self.inner.lock().progress = progress;
+    }
+
+    fn set_fetched(&self, fetched: u64) {
+        self.inner.lock().fetched = fetched;
+    }
+
+    fn set_uploaded(&self, uploaded: u64) {
+        self.inner.lock().uploaded = uploaded;
     }
 }
 
 impl TorrentStatsProvider for FakeStats {
     fn get(&self) -> TrackerCommsStats {
-        let (total, downloaded) = *self.inner.lock();
+        let inner = *self.inner.lock();
         TrackerCommsStats {
-            uploaded_bytes: 0,
-            downloaded_bytes: downloaded,
-            total_bytes: total,
+            uploaded_bytes: inner.uploaded,
+            downloaded_bytes: inner.fetched,
+            progress_bytes: inner.progress,
+            total_bytes: inner.total,
             torrent_state: crate::TrackerCommsStatsState::Live,
         }
     }
@@ -304,7 +140,7 @@ async fn completed_is_sent_once_on_the_transition() {
     let running = run(&tracker, stats.clone()).await;
 
     tracker.wait_for(1, Duration::from_secs(5)).await;
-    stats.set_downloaded(1000);
+    stats.set_progress(1000);
     running.comms.reannounce();
     tracker.wait_for(2, Duration::from_secs(5)).await;
     running.comms.reannounce();
@@ -352,7 +188,7 @@ async fn completed_is_retried_through_a_502() {
     let running = run(&tracker, stats.clone()).await;
 
     tracker.wait_for(1, Duration::from_secs(5)).await;
-    stats.set_downloaded(1000);
+    stats.set_progress(1000);
     running.comms.reannounce();
     tracker.wait_for(2, Duration::from_secs(5)).await;
 
@@ -514,4 +350,41 @@ async fn a_tracker_that_was_never_reached_reports_not_contacted() {
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0].state, TrackerState::NotContacted);
     assert_eq!(statuses[0].url, "http://127.0.0.1:1");
+}
+
+#[tokio::test]
+async fn a_torrent_complete_at_start_announces_downloaded_zero() {
+    let tracker = FakeTracker::start(|_| Reply::ok(body_empty(600, None))).await;
+    // Added with its data already on disk: everything verified, nothing
+    // fetched from a peer. The honest first announce is a seed (left 0)
+    // that downloaded nothing, not one charged the full size.
+    let stats = FakeStats::new(1000, 1000);
+    stats.set_uploaded(25);
+    let _running = run(&tracker, stats.clone()).await;
+
+    tracker.wait_for(1, Duration::from_secs(5)).await;
+    let first = &tracker.announces()[0];
+    assert_eq!(first.event(), Some("started"));
+    assert_eq!(first.downloaded(), 0);
+    assert_eq!(first.left(), 0);
+    assert_eq!(first.uploaded(), 25);
+}
+
+#[tokio::test]
+async fn a_real_transfer_announces_the_fetched_bytes() {
+    let tracker = FakeTracker::start(|_| Reply::ok(body_empty(600, None))).await;
+    let stats = FakeStats::new(1000, 0);
+    let running = run(&tracker, stats.clone()).await;
+
+    tracker.wait_for(1, Duration::from_secs(5)).await;
+    // Mid-transfer: 300 bytes came off the wire, 200 of them verified so
+    // far. `downloaded` reports the transfer, `left` the verified progress.
+    stats.set_fetched(300);
+    stats.set_progress(200);
+    running.comms.reannounce();
+    tracker.wait_for(2, Duration::from_secs(5)).await;
+
+    let second = &tracker.announces()[1];
+    assert_eq!(second.downloaded(), 300);
+    assert_eq!(second.left(), 800);
 }

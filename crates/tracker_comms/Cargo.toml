@@ -32,6 +32,13 @@ backon.workspace = true
 itertools.workspace = true
 serde_with.workspace = true
 
+[features]
+# Exposes the fake HTTP tracker of `test_support` to downstream test suites,
+# so librqbit's session-level announce tests drive the same harness as this
+# crate's own. The tokio features are the ones that harness needs and the
+# plain dependency above does not enable.
+test-support = ["tokio/net", "tokio/io-util", "tokio/rt", "tokio/sync", "tokio/time", "tokio/macros"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = [
     "io-util",
