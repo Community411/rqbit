@@ -526,20 +526,30 @@ impl Default for SessionOptions {
     }
 }
 
-fn torrent_file_from_info_bytes(info_bytes: &[u8], trackers: &[url::Url]) -> anyhow::Result<Bytes> {
+/// A .torrent file around already-fetched info bytes, `trackers` being the
+/// BEP 12 tiers to write into `announce-list` (and the first of them into
+/// `announce`, for clients predating that BEP).
+fn torrent_file_from_info_bytes(
+    info_bytes: &[u8],
+    trackers: &[Vec<url::Url>],
+) -> anyhow::Result<Bytes> {
     #[derive(Serialize)]
     struct Tmp<'a> {
         announce: &'a str,
         #[serde(rename = "announce-list")]
-        announce_list: &'a [&'a [url::Url]],
+        announce_list: &'a [Vec<url::Url>],
         info: bencode::raw_value::RawValue<&'a [u8]>,
     }
 
     let mut w = Vec::new();
     let v = Tmp {
         info: bencode::raw_value::RawValue(info_bytes),
-        announce: trackers.first().map(|s| s.as_str()).unwrap_or(""),
-        announce_list: &[trackers],
+        announce: trackers
+            .first()
+            .and_then(|tier| tier.first())
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+        announce_list: trackers,
     };
     bencode_serialize_to_writer(&v, &mut w)?;
     Ok(w.into())
@@ -557,8 +567,38 @@ pub(crate) struct CheckedIncomingConnection {
 struct InternalAddResult {
     info_hash: Id20,
     metadata: Option<TorrentMetadata>,
-    trackers: Vec<url::Url>,
+    /// BEP 12 tiers, see `ManagedTorrentShared::trackers`.
+    trackers: Vec<Vec<url::Url>>,
     name: Option<String>,
+}
+
+/// Parse tracker tiers, dropping what does not parse and any URL already
+/// present in an earlier tier (the first occurrence keeps its place), then
+/// dropping tiers left empty. Order is preserved: BEP 12 tiers are ordered
+/// and the trackers inside one are shuffled by the announcer, once.
+fn tracker_tiers<S: AsRef<str>>(tiers: impl IntoIterator<Item = Vec<S>>) -> Vec<Vec<url::Url>> {
+    let mut seen = std::collections::HashSet::new();
+    tiers
+        .into_iter()
+        .map(|tier| {
+            tier.into_iter()
+                .filter_map(|t| url::Url::parse(t.as_ref()).ok())
+                .filter(|u| seen.insert(u.clone()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|tier| !tier.is_empty())
+        .collect()
+}
+
+/// Append each of `extra` that is not already in `tiers` as a tier of its
+/// own: an added tracker is independent of the torrent's own list, so it is
+/// announced to on its own schedule rather than as a fallback of the others.
+fn append_tracker_tiers(tiers: &mut Vec<Vec<url::Url>>, extra: impl IntoIterator<Item = url::Url>) {
+    for url in extra {
+        if !tiers.iter().flatten().any(|u| *u == url) {
+            tiers.push(vec![url]);
+        }
+    }
 }
 
 impl Session {
@@ -1131,11 +1171,8 @@ impl Session {
 
                     InternalAddResult {
                         info_hash,
-                        trackers: magnet
-                            .trackers
-                            .into_iter()
-                            .filter_map(|t| url::Url::parse(&t).ok())
-                            .collect(),
+                        // A magnet lists independent trackers: one tier each.
+                        trackers: tracker_tiers(magnet.trackers.into_iter().map(|t| vec![t])),
                         metadata: None,
                         name: magnet.name,
                     }
@@ -1158,20 +1195,25 @@ impl Session {
                         }
                     };
 
-                    let mut trackers = torrent
-                        .meta
-                        .iter_announce()
-                        .unique()
-                        .filter_map(|tracker| match std::str::from_utf8(tracker.as_ref()) {
-                            Ok(url) => Some(url.to_owned()),
-                            Err(_) => {
-                                warn!("cannot parse tracker url as utf-8, ignoring");
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
+                    let mut trackers =
+                        tracker_tiers(torrent.meta.announce_tiers().into_iter().map(|tier| {
+                            tier.into_iter()
+                                .filter_map(|tracker| match std::str::from_utf8(tracker.as_ref()) {
+                                    Ok(url) => Some(url.to_owned()),
+                                    Err(_) => {
+                                        warn!("cannot parse tracker url as utf-8, ignoring");
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        }));
                     if let Some(custom_trackers) = opts.trackers.clone() {
-                        trackers.extend(custom_trackers);
+                        append_tracker_tiers(
+                            &mut trackers,
+                            custom_trackers
+                                .iter()
+                                .filter_map(|t| url::Url::parse(t).ok()),
+                        );
                     }
 
                     InternalAddResult {
@@ -1181,10 +1223,7 @@ impl Session {
                             torrent.torrent_bytes,
                             torrent.meta.info.raw_bytes.0,
                         )?),
-                        trackers: trackers
-                            .iter()
-                            .filter_map(|t| url::Url::parse(t).ok())
-                            .collect(),
+                        trackers,
                         name: None,
                     }
                 }
@@ -1368,7 +1407,7 @@ impl Session {
                 id,
                 span,
                 info_hash,
-                trackers: trackers.into_iter().collect(),
+                trackers,
                 spawner: self.spawner.clone(),
                 tracker_comms: tracker_comms_slot.clone(),
                 peer_id: self.peer_id,
@@ -1546,7 +1585,7 @@ impl Session {
         let is_private = t.with_metadata(|m| m.info.info().private).unwrap_or(false);
         self.make_peer_rx(
             t.info_hash(),
-            t.shared().trackers.iter().cloned().collect(),
+            t.shared().trackers.clone(),
             announce,
             t.shared().options.force_tracker_interval,
             t.shared().options.initial_peers.clone(),
@@ -1560,7 +1599,7 @@ impl Session {
     fn make_peer_rx(
         self: &Arc<Self>,
         info_hash: Id20,
-        mut trackers: Vec<url::Url>,
+        mut trackers: Vec<Vec<url::Url>>,
         announce: bool,
         force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
@@ -1585,16 +1624,10 @@ impl Session {
 
         if self.disable_trackers {
             trackers.clear();
-        }
-
-        if is_private && trackers.len() > 1 {
-            warn!(
-                ?info_hash,
-                "private trackers are not fully implemented, so using only the first tracker"
-            );
-            trackers.truncate(1);
-        } else if !self.disable_trackers {
-            trackers.extend(self.trackers.iter().cloned());
+        } else if !is_private {
+            // BEP 27: a private torrent takes its peers from its own
+            // trackers alone, so the session-wide trackers stay off it.
+            append_tracker_tiers(&mut trackers, self.trackers.iter().cloned());
         }
 
         let tracker_rx_stats = PeerRxTorrentInfo {
@@ -1604,7 +1637,7 @@ impl Session {
         let tracker_rx = TrackerComms::start(
             info_hash,
             self.peer_id,
-            trackers.into_iter().collect(),
+            trackers,
             Box::new(tracker_rx_stats),
             force_tracker_interval,
             self.announce_port().unwrap_or(4240),
@@ -1676,7 +1709,7 @@ impl Session {
         self: &Arc<Self>,
         info_hash: Id20,
         peer_rx: PeerStream,
-        trackers: &[url::Url],
+        trackers: &[Vec<url::Url>],
         peer_opts: Option<PeerConnectionOptions>,
     ) -> anyhow::Result<ResolveMagnetResult> {
         match read_metainfo_from_peer_receiver(
@@ -1865,10 +1898,15 @@ mod tests {
 
     #[test]
     fn test_torrent_file_from_info_and_bytes() {
-        fn get_trackers(info: &TorrentMetaV1<ByteBuf>) -> Vec<url::Url> {
-            info.iter_announce()
-                .filter_map(|t| std::str::from_utf8(t.as_ref()).ok().map(|t| t.to_owned()))
-                .filter_map(|t| t.parse().ok())
+        fn get_trackers(info: &TorrentMetaV1<ByteBuf>) -> Vec<Vec<url::Url>> {
+            info.announce_tiers()
+                .into_iter()
+                .map(|tier| {
+                    tier.into_iter()
+                        .filter_map(|t| std::str::from_utf8(t.as_ref()).ok().map(|t| t.to_owned()))
+                        .filter_map(|t| t.parse().ok())
+                        .collect_vec()
+                })
                 .collect_vec()
         }
 
@@ -1882,6 +1920,8 @@ mod tests {
         let generated_parsed = torrent_from_bytes(generated_torrent.as_ref()).unwrap();
         assert_eq!(parsed.info_hash, generated_parsed.info_hash);
         assert_eq!(parsed.info, generated_parsed.info);
+        // The tiers survive the round trip, so a fallback tracker written
+        // beside its primary stays a fallback of it.
         assert_eq!(parsed_trackers, get_trackers(&generated_parsed));
     }
 }

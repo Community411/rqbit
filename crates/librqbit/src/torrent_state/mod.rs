@@ -197,7 +197,10 @@ pub struct ManagedTorrentShared {
     pub id: TorrentId,
     pub info_hash: Id20,
     pub(crate) spawner: BlockingSpawner,
-    pub trackers: HashSet<url::Url>,
+    /// The trackers of this torrent in their BEP 12 tiers: the trackers of
+    /// one tier are fallbacks of each other, and every tier is announced to
+    /// on its own. Read `tracker_urls()` for the flat view.
+    pub trackers: Vec<Vec<url::Url>>,
     pub(crate) tracker_comms: Arc<TrackerCommsSlot>,
     pub peer_id: Id20,
     pub span: tracing::Span,
@@ -213,6 +216,11 @@ pub struct ManagedTorrentShared {
 }
 
 impl ManagedTorrentShared {
+    /// Every tracker URL, tier structure flattened, in tier order.
+    pub fn tracker_urls(&self) -> impl Iterator<Item = &url::Url> {
+        self.trackers.iter().flatten()
+    }
+
     pub(crate) fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
     }

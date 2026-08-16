@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
@@ -9,15 +8,11 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use anyhow::Context;
-use anyhow::bail;
-use backon::ExponentialBuilder;
-use backon::Retryable;
-use futures::FutureExt;
 use futures::StreamExt;
-use futures::future::Either;
 use futures::stream::BoxStream;
 use futures::stream::FuturesUnordered;
 use parking_lot::RwLock;
+use rand::seq::SliceRandom;
 use tokio::sync::watch;
 use tracing::Instrument;
 use tracing::debug;
@@ -57,6 +52,14 @@ pub struct TrackerComms {
     udp_client: UdpTrackerClient,
     key: u32,
     trackers: Vec<SupportedTracker>,
+    /// BEP 12 tiers, as indices into `trackers`, each tier already shuffled.
+    /// One announce task per tier; inside a tier the trackers are fallbacks
+    /// of each other, tried in order until one answers.
+    tiers: Vec<Vec<usize>>,
+    /// Which trackers have answered an announce at least once this session.
+    /// A `stopped` only goes to those: a tracker that never registered this
+    /// peer has nothing to forget.
+    contacted: Vec<AtomicBool>,
     statuses: RwLock<Vec<TrackerStatus>>,
     reannounce_tx: watch::Sender<u64>,
     stopped_sent: AtomicBool,
@@ -133,6 +136,10 @@ pub struct TrackerStatus {
     /// elided on purpose: a private tracker carries the account's passkey in
     /// the announce path, and this value is meant to be displayed and logged.
     pub url: String,
+    /// The BEP 12 tier this tracker belongs to, zero-based. Trackers of one
+    /// tier are fallbacks of each other: one of them is announced to per
+    /// cycle, the others stay `NotContacted` until it fails.
+    pub tier: usize,
     pub state: TrackerState,
     pub last_announce: Option<SystemTime>,
     pub next_announce: Option<SystemTime>,
@@ -145,9 +152,10 @@ pub struct TrackerStatus {
 }
 
 impl TrackerStatus {
-    fn new(url: String) -> Self {
+    fn new(url: String, tier: usize) -> Self {
         Self {
             url,
+            tier,
             state: TrackerState::NotContacted,
             last_announce: None,
             next_announce: None,
@@ -330,41 +338,66 @@ async fn udp_tracker_to_socket_addrs(
 }
 
 impl TrackerComms {
+    /// `tiers` is the BEP 12 announce list: the trackers of one tier are
+    /// fallbacks of each other and get one announce per cycle between them,
+    /// every tier is announced to on its own schedule. A single tracker is a
+    /// tier of one; a plain list of independent trackers is one tier each.
     // TODO: fix too many args
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         info_hash: Id20,
         peer_id: Id20,
-        trackers: HashSet<Url>,
+        tiers: Vec<Vec<Url>>,
         stats: Box<dyn TorrentStatsProvider>,
         force_interval: Option<Duration>,
         announce_port: u16,
         reqwest_client: reqwest::Client,
         udp_client: UdpTrackerClient,
     ) -> Option<(BoxStream<'static, SocketAddr>, Arc<TrackerComms>)> {
-        let trackers = trackers
-            .into_iter()
-            .filter_map(|t| match t.scheme() {
-                "http" | "https" => Some(SupportedTracker::Http(t)),
-                "udp" => Some(SupportedTracker::Udp(t)),
-                _ => {
-                    debug!("unsupported tracker URL: {}", redacted_tracker_url(&t));
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut trackers: Vec<SupportedTracker> = Vec::new();
+        let mut tier_indices: Vec<usize> = Vec::new();
+        let mut tier_of: Vec<Vec<usize>> = Vec::new();
+        for tier in tiers {
+            let mut members = Vec::new();
+            for t in tier {
+                let supported = match t.scheme() {
+                    "http" | "https" => SupportedTracker::Http(t),
+                    "udp" => SupportedTracker::Udp(t),
+                    _ => {
+                        debug!("unsupported tracker URL: {}", redacted_tracker_url(&t));
+                        continue;
+                    }
+                };
+                members.push(trackers.len());
+                tier_indices.push(tier_of.len());
+                trackers.push(supported);
+            }
+            if members.is_empty() {
+                continue;
+            }
+            // BEP 12: a tier is shuffled once when first read, so the
+            // trackers of one tier share the swarm instead of the first
+            // listed one carrying every client.
+            members.shuffle(&mut rand::rng());
+            tier_of.push(members);
+        }
         if trackers.is_empty() {
             debug!(?info_hash, "trackers list is empty");
             return None;
         }
 
-        tracing::trace!(?trackers);
+        tracing::trace!(?trackers, tiers = ?tier_of);
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SocketAddr>(16);
         let (reannounce_tx, _) = watch::channel(0u64);
         let statuses = trackers
             .iter()
-            .map(|t| TrackerStatus::new(redacted_tracker_url(t.url())))
+            .zip(tier_indices)
+            .map(|(t, tier)| TrackerStatus::new(redacted_tracker_url(t.url()), tier))
+            .collect::<Vec<_>>();
+        let contacted = trackers
+            .iter()
+            .map(|_| AtomicBool::new(false))
             .collect::<Vec<_>>();
 
         let comms = Arc::new(Self {
@@ -378,6 +411,8 @@ impl TrackerComms {
             udp_client,
             key: rand::random(),
             trackers,
+            tiers: tier_of,
+            contacted,
             statuses: RwLock::new(statuses),
             reannounce_tx,
             stopped_sent: AtomicBool::new(false),
@@ -388,8 +423,8 @@ impl TrackerComms {
             use futures::StreamExt;
             let comms = stream_comms;
             let mut futures = FuturesUnordered::new();
-            for (index, tracker) in comms.trackers.iter().enumerate() {
-                futures.push(comms.add_tracker(index, tracker))
+            for tier in 0..comms.tiers.len() {
+                futures.push(comms.task_tier_monitor(tier))
             }
             while !(futures.is_empty()) {
                 tokio::select! {
@@ -432,40 +467,37 @@ impl TrackerComms {
         if self.stopped_sent.swap(true, Ordering::SeqCst) {
             return;
         }
-        let announces = self.trackers.iter().enumerate().map(|(index, tracker)| {
-            let span = debug_span!(
-                parent: None,
-                "announce_stopped",
-                tracker = %redacted_tracker_url(tracker.url()),
-                info_hash = ?self.info_hash
-            );
-            async move {
-                match tracker {
-                    SupportedTracker::Http(url) => {
-                        self.set_status_updating(index);
-                        match self
-                            .announce_http(url, Some(TrackerRequestEvent::Stopped))
-                            .await
-                        {
-                            Ok(ok) => self.set_status_ok(index, &ok, None),
-                            Err(err) => {
-                                debug!("error announcing stopped: {}", err.message);
-                                self.set_status_error(index, err.message, None);
-                            }
-                        }
-                    }
-                    SupportedTracker::Udp(url) => {
-                        if let Err(e) = self
-                            .announce_udp_to_url(url, Some(TrackerRequestEvent::Stopped))
-                            .await
-                        {
-                            debug!("error announcing stopped: {e:#}");
+        // Only the trackers that answered this session: a `stopped` to one
+        // that never registered the peer is a request for nothing, and the
+        // standby trackers of a tier are exactly those.
+        let announces = self
+            .trackers
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.contacted[*index].load(Ordering::SeqCst))
+            .map(|(index, tracker)| {
+                let span = debug_span!(
+                    parent: None,
+                    "announce_stopped",
+                    tracker = %redacted_tracker_url(tracker.url()),
+                    info_hash = ?self.info_hash
+                );
+                async move {
+                    self.set_status_updating(index);
+                    let mut udp_addrs = None;
+                    match self
+                        .announce_once(index, Some(TrackerRequestEvent::Stopped), &mut udp_addrs)
+                        .await
+                    {
+                        Ok(ok) => self.set_status_ok(index, &ok, None),
+                        Err(err) => {
+                            debug!("error announcing stopped: {}", err.message);
+                            self.set_status_error(index, err.message, None);
                         }
                     }
                 }
-            }
-            .instrument(span)
-        });
+                .instrument(span)
+            });
         if tokio::time::timeout(deadline, futures::future::join_all(announces))
             .await
             .is_err()
@@ -521,80 +553,130 @@ impl TrackerComms {
         }
     }
 
-    fn add_tracker(
-        &self,
-        index: usize,
-        url: &SupportedTracker,
-    ) -> Either<
-        impl std::future::Future<Output = anyhow::Result<()>> + '_ + Send,
-        impl std::future::Future<Output = anyhow::Result<()>> + '_ + Send,
-    > {
-        let info_hash = self.info_hash;
-        let redacted = redacted_tracker_url(url.url());
-        match url {
-            SupportedTracker::Udp(url) => {
-                let span = debug_span!(parent: None, "udp_tracker", tracker = %redacted, info_hash = ?info_hash);
-                self.task_single_tracker_monitor_udp(index, url.clone())
-                    .instrument(span)
-                    .right_future()
-            }
-            SupportedTracker::Http(url) => {
-                let span = debug_span!(
-                    parent: None,
-                    "http_tracker",
-                    tracker = %redacted,
-                    info_hash = ?info_hash
-                );
-                self.task_single_tracker_monitor_http(index, url.clone())
-                    .instrument(span)
-                    .left_future()
-            }
-        }
-    }
+    /// The announce loop of one tier.
+    ///
+    /// Each cycle walks the tier in order and stops at the first tracker
+    /// that answers; that tracker moves to the front (BEP 12) and its
+    /// interval sets the sleep. A tracker that fails is left in `Error` and
+    /// the next one is tried in the same cycle, so a fallback takes over
+    /// without waiting for a backoff. When the whole tier fails, the sleep
+    /// is a bounded exponential backoff, or the `Retry-After` the last
+    /// tracker sent.
+    ///
+    /// The BEP 3 events are per tier: `started` goes to a tracker the first
+    /// time it is contacted (a fallback taking over mid-session included),
+    /// `completed` exactly once per tier, on the transition.
+    async fn task_tier_monitor(&self, tier: usize) -> anyhow::Result<()> {
+        let mut order = self.tiers[tier].clone();
+        let redacted = order
+            .iter()
+            .map(|i| redacted_tracker_url(self.trackers[*i].url()))
+            .collect::<Vec<_>>();
+        let span = debug_span!(
+            parent: None,
+            "tracker_tier",
+            tier,
+            trackers = ?redacted,
+            info_hash = ?self.info_hash
+        );
+        async move {
+            trace!("starting monitor");
+            let mut events = AnnounceEvents::new();
+            let mut consecutive_failures: u32 = 0;
+            let mut reannounce_rx = self.reannounce_tx.subscribe();
+            // Last resolved addresses per UDP tracker, reused while DNS
+            // fails so a resolver hiccup does not silence a tracker that
+            // was reachable a minute ago.
+            let mut udp_addrs = vec![None; self.trackers.len()];
 
-    async fn task_single_tracker_monitor_http(
-        &self,
-        index: usize,
-        tracker_url: Url,
-    ) -> anyhow::Result<()> {
-        trace!("starting monitor");
-        let mut events = AnnounceEvents::new();
-        let mut consecutive_errors: u32 = 0;
-        let mut reannounce_rx = self.reannounce_tx.subscribe();
+            loop {
+                let tier_event = events.next_event(&self.stats.get());
+                let mut answered: Option<Duration> = None;
+                let mut last_failure: Option<AnnounceFailure> = None;
+                let mut failed: Vec<usize> = Vec::new();
 
-        loop {
-            let event = events.next_event(&self.stats.get());
-            self.set_status_updating(index);
-
-            let sleep_for = match self.announce_http(&tracker_url, event).await {
-                Ok(ok) => {
-                    events.on_success();
-                    consecutive_errors = 0;
-                    let sleep_for = self.force_tracker_interval.unwrap_or(ok.interval);
-                    self.set_status_ok(index, &ok, Some(sleep_for));
-                    // An answer with no peers is not a dead swarm: a front
-                    // proxy synthesises one while the tracker itself is down.
-                    for peer in ok.peers {
-                        if self.tx.send(peer).await.is_err() {
-                            return Ok(());
+                for pos in 0..order.len() {
+                    let index = order[pos];
+                    // A tracker contacted for the first time gets `started`
+                    // even when the tier already announced elsewhere: it has
+                    // never heard of this peer.
+                    let event = tier_event.or_else(|| {
+                        (!self.contacted[index].load(Ordering::SeqCst))
+                            .then_some(TrackerRequestEvent::Started)
+                    });
+                    self.set_status_updating(index);
+                    match self
+                        .announce_once(index, event, &mut udp_addrs[index])
+                        .await
+                    {
+                        Ok(ok) => {
+                            events.on_success();
+                            self.contacted[index].store(true, Ordering::SeqCst);
+                            consecutive_failures = 0;
+                            let sleep_for = self.force_tracker_interval.unwrap_or(ok.interval);
+                            self.set_status_ok(index, &ok, Some(sleep_for));
+                            // The tracker that answers moves to the front of
+                            // its tier, so the next cycle asks it first.
+                            order[..=pos].rotate_right(1);
+                            // An answer with no peers is not a dead swarm: a
+                            // front proxy synthesises one while the tracker
+                            // itself is down.
+                            for peer in ok.peers {
+                                if self.tx.send(peer).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            answered = Some(sleep_for);
+                            break;
+                        }
+                        Err(err) => {
+                            debug!(
+                                tracker = %redacted_tracker_url(self.trackers[index].url()),
+                                "error announcing to tracker: {}",
+                                err.message
+                            );
+                            self.set_status_error(index, err.message.clone(), None);
+                            failed.push(index);
+                            last_failure = Some(err);
                         }
                     }
-                    sleep_for
                 }
-                Err(err) => {
-                    consecutive_errors += 1;
-                    let retry_in = err
-                        .retry_after
-                        .unwrap_or_else(|| error_backoff(consecutive_errors));
-                    debug!(?retry_in, "error announcing to tracker: {}", err.message);
-                    self.set_status_error(index, err.message, Some(retry_in));
-                    retry_in
-                }
-            };
 
-            trace!(?sleep_for, "sleeping until the next announce");
-            self.sleep_or_reannounce(sleep_for, &mut reannounce_rx)
-                .await;
+                let sleep_for = match answered {
+                    Some(d) => d,
+                    None => {
+                        consecutive_failures += 1;
+                        let retry_in = last_failure
+                            .and_then(|f| f.retry_after)
+                            .unwrap_or_else(|| error_backoff(consecutive_failures));
+                        debug!(?retry_in, "every tracker of the tier failed");
+                        let next = SystemTime::now() + retry_in;
+                        for index in failed {
+                            self.with_status(index, |s| s.next_announce = Some(next));
+                        }
+                        retry_in
+                    }
+                };
+
+                trace!(?sleep_for, "sleeping until the next announce");
+                self.sleep_or_reannounce(sleep_for, &mut reannounce_rx)
+                    .await;
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// One announce to one tracker, whatever its transport.
+    async fn announce_once(
+        &self,
+        index: usize,
+        event: Option<TrackerRequestEvent>,
+        udp_addrs: &mut Option<UdpTrackerResolveResult>,
+    ) -> Result<AnnounceOk, AnnounceFailure> {
+        match &self.trackers[index] {
+            SupportedTracker::Http(url) => self.announce_http(url, event).await,
+            SupportedTracker::Udp(url) => self.announce_udp_url(url, event, udp_addrs).await,
         }
     }
 
@@ -692,106 +774,54 @@ impl TrackerComms {
         })
     }
 
-    async fn task_single_tracker_monitor_udp(&self, index: usize, url: Url) -> anyhow::Result<()> {
-        if url.scheme() != "udp" {
-            bail!("expected UDP scheme");
-        }
-        let (host, port) = (
-            url.host().context("missing host")?,
-            url.port().context("missing port")?,
-        );
-
-        let mut events = AnnounceEvents::new();
-        let mut reannounce_rx = self.reannounce_tx.subscribe();
-        let mut sleep_interval: Option<Duration> = None;
-        let mut prev_addrs: Option<UdpTrackerResolveResult> = None;
-        loop {
-            if let Some(i) = sleep_interval {
-                trace!(interval=?sleep_interval, "sleeping");
-                self.sleep_or_reannounce(i, &mut reannounce_rx).await;
-            }
-
-            // This should retry forever until the addrs are resolved.
-            let addrs = (async || {
-                udp_tracker_to_socket_addrs(host.clone(), port)
-                    .instrument(trace_span!("resolve", ?host))
-                    .await
-                    .or_else(|err| prev_addrs.ok_or(err))
-            })
-            .retry(
-                ExponentialBuilder::new()
-                    .without_max_times()
-                    .with_max_delay(Duration::from_secs(60))
-                    .with_jitter(),
-            )
-            .notify(|err, retry| debug!(retry_in=?retry, "error resolving tracker: {err:#}"))
-            .await
-            .context("this shouldn't happen: failed resolving tracker addrs")?;
-
-            prev_addrs = Some(addrs);
-
-            let event = events.next_event(&self.stats.get());
-            self.set_status_updating(index);
-
-            let result = match addrs {
-                UdpTrackerResolveResult::One(addr) => {
-                    self.announce_udp(addr, event)
-                        .instrument(trace_span!("udp request", ?addr))
-                        .await
-                }
-                UdpTrackerResolveResult::Two(v4, v6) => {
-                    let (r4, r6) = tokio::join!(
-                        self.announce_udp(v4.into(), event)
-                            .instrument(trace_span!("udp request", addr=?v4)),
-                        self.announce_udp(v6.into(), event)
-                            .instrument(trace_span!("udp request", addr=?v6))
-                    );
-                    r4.or(r6)
-                }
-            };
-
-            match result {
-                Ok(ok) => {
-                    events.on_success();
-                    let sleep_for = self.force_tracker_interval.unwrap_or(ok.interval);
-                    self.set_status_ok(index, &ok, Some(sleep_for));
-                    sleep_interval = Some(sleep_for);
-                    for peer in ok.peers {
-                        if self.tx.send(peer).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
-                Err(e) => {
-                    let retry_in = sleep_interval.unwrap_or(Duration::from_secs(60));
-                    debug!(?retry_in, "error announcing to tracker: {e:#}");
-                    self.set_status_error(index, format!("{e:#}"), Some(retry_in));
-                    sleep_interval = Some(retry_in);
-                }
-            }
-        }
-    }
-
-    async fn announce_udp_to_url(
+    /// One UDP announce: resolve the host, then announce, to both address
+    /// families when the name has both. `cache` keeps the last resolution
+    /// for the next call, and stands in when the resolver fails.
+    async fn announce_udp_url(
         &self,
         url: &Url,
         event: Option<TrackerRequestEvent>,
-    ) -> anyhow::Result<()> {
-        let host = url.host().context("missing host")?;
-        let port = url.port().context("missing port")?;
-        match udp_tracker_to_socket_addrs(host, port).await? {
+        cache: &mut Option<UdpTrackerResolveResult>,
+    ) -> Result<AnnounceOk, AnnounceFailure> {
+        let host = url
+            .host()
+            .ok_or_else(|| AnnounceFailure::new("missing host".to_owned()))?;
+        let port = url
+            .port()
+            .ok_or_else(|| AnnounceFailure::new("missing port".to_owned()))?;
+        let addrs = match udp_tracker_to_socket_addrs(host.clone(), port)
+            .instrument(trace_span!("resolve", ?host))
+            .await
+        {
+            Ok(addrs) => {
+                *cache = Some(addrs);
+                addrs
+            }
+            Err(err) => match *cache {
+                Some(addrs) => {
+                    debug!("error resolving tracker, reusing the last addresses: {err:#}");
+                    addrs
+                }
+                None => return Err(AnnounceFailure::new(format!("{err:#}"))),
+            },
+        };
+        let result = match addrs {
             UdpTrackerResolveResult::One(addr) => {
-                self.announce_udp(addr, event).await?;
+                self.announce_udp(addr, event)
+                    .instrument(trace_span!("udp request", ?addr))
+                    .await
             }
             UdpTrackerResolveResult::Two(v4, v6) => {
                 let (r4, r6) = tokio::join!(
-                    self.announce_udp(v4.into(), event),
+                    self.announce_udp(v4.into(), event)
+                        .instrument(trace_span!("udp request", addr=?v4)),
                     self.announce_udp(v6.into(), event)
+                        .instrument(trace_span!("udp request", addr=?v6))
                 );
-                r4.or(r6)?;
+                r4.or(r6)
             }
-        }
-        Ok(())
+        };
+        result.map_err(|e| AnnounceFailure::new(format!("{e:#}")))
     }
 
     async fn announce_udp(

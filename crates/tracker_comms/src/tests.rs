@@ -83,6 +83,10 @@ impl Drop for Running {
 }
 
 async fn run(tracker: &FakeTracker, stats: FakeStats) -> Running {
+    run_tiers(vec![vec![tracker.url.clone()]], stats).await
+}
+
+async fn run_tiers(tiers: Vec<Vec<Url>>, stats: FakeStats) -> Running {
     use futures::StreamExt;
 
     let udp = UdpTrackerClient::new(CancellationToken::new(), None)
@@ -91,7 +95,7 @@ async fn run(tracker: &FakeTracker, stats: FakeStats) -> Running {
     let (mut peer_rx, comms) = TrackerComms::start(
         librqbit_core::hash_id::Id20::new([1u8; 20]),
         librqbit_core::hash_id::Id20::new([2u8; 20]),
-        [tracker.url.clone()].into_iter().collect(),
+        tiers,
         Box::new(stats),
         None,
         6881,
@@ -104,6 +108,19 @@ async fn run(tracker: &FakeTracker, stats: FakeStats) -> Running {
     // it for them to run at all.
     let drain = tokio::spawn(async move { while peer_rx.next().await.is_some() {} });
     Running { comms, drain }
+}
+
+/// Wait until the two trackers together hold `n` announces.
+async fn wait_for_total(a: &FakeTracker, b: &FakeTracker, n: usize, within: Duration) {
+    let deadline = std::time::Instant::now() + within;
+    while a.count() + b.count() < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {} announces after {within:?}, wanted {n}",
+            a.count() + b.count()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -336,7 +353,7 @@ async fn a_tracker_that_was_never_reached_reports_not_contacted() {
     let (peer_rx, comms) = TrackerComms::start(
         librqbit_core::hash_id::Id20::new([1u8; 20]),
         librqbit_core::hash_id::Id20::new([2u8; 20]),
-        [url].into_iter().collect(),
+        vec![vec![url]],
         Box::new(()),
         None,
         6881,
@@ -387,4 +404,175 @@ async fn a_real_transfer_announces_the_fetched_bytes() {
     let second = &tracker.announces()[1];
     assert_eq!(second.downloaded(), 300);
     assert_eq!(second.left(), 800);
+}
+
+// ==========================================================================
+// BEP 12 tiers
+// ==========================================================================
+
+#[tokio::test]
+async fn one_tier_of_two_trackers_announces_to_one_of_them_per_cycle() {
+    // Both healthy: one of them carries every announce, the other is a
+    // standby that never hears from us. Which one is the shuffle's choice.
+    let a = FakeTracker::start(|_| Reply::ok(body_empty(1, None))).await;
+    let b = FakeTracker::start(|_| Reply::ok(body_empty(1, None))).await;
+    let running = run_tiers(
+        vec![vec![a.url.clone(), b.url.clone()]],
+        FakeStats::new(1000, 0),
+    )
+    .await;
+
+    wait_for_total(&a, &b, 3, Duration::from_secs(10)).await;
+    let (used, standby) = if a.count() > 0 { (&a, &b) } else { (&b, &a) };
+    assert_eq!(standby.count(), 0, "the standby tracker was announced to");
+    assert_eq!(used.announces()[0].event(), Some("started"));
+    assert_eq!(used.announces()[1].event(), None);
+
+    let statuses = running.comms.tracker_statuses();
+    assert_eq!(statuses.len(), 2);
+    assert!(statuses.iter().all(|s| s.tier == 0));
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| s.state == TrackerState::NotContacted)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_tier_falls_over_to_the_next_tracker_when_one_refuses() {
+    // The first tracker always answers 503; the fallback answers. The
+    // fallback carries the announces, with `started` on its first one, and
+    // once it answered it is asked first: the refusing one is tried at most
+    // once per failed cycle before it, never after.
+    let dead = FakeTracker::start(|_| Reply::status("503 Service Unavailable")).await;
+    let live = FakeTracker::start(|_| Reply::ok(body_empty(1, None))).await;
+    let running = run_tiers(
+        vec![vec![dead.url.clone(), live.url.clone()]],
+        FakeStats::new(1000, 0),
+    )
+    .await;
+
+    live.wait_for(3, Duration::from_secs(10)).await;
+    assert_eq!(live.announces()[0].event(), Some("started"));
+    assert!(
+        dead.count() <= 1,
+        "the refusing tracker was retried after the fallback answered: {}",
+        dead.count()
+    );
+
+    let statuses = running.comms.tracker_statuses();
+    let live_status = statuses
+        .iter()
+        .find(|s| s.url == redacted(&live.url))
+        .unwrap();
+    assert_eq!(live_status.state, TrackerState::Working);
+    let dead_status = statuses
+        .iter()
+        .find(|s| s.url == redacted(&dead.url))
+        .unwrap();
+    assert!(matches!(
+        dead_status.state,
+        TrackerState::Error | TrackerState::NotContacted
+    ));
+}
+
+#[tokio::test]
+async fn a_tier_hands_over_mid_session_and_the_newcomer_gets_started() {
+    // The tracker that carried the announces starts refusing; the other one
+    // takes over within the same cycle, and its first announce says
+    // `started`, since it never heard of this peer.
+    let flaky = FakeTracker::start(|i| {
+        if i == 0 {
+            Reply::ok(body_empty(1, None))
+        } else {
+            Reply::status("503 Service Unavailable")
+        }
+    })
+    .await;
+    let steady = FakeTracker::start(|_| Reply::ok(body_empty(1, None))).await;
+    let _running = run_tiers(
+        vec![vec![flaky.url.clone(), steady.url.clone()]],
+        FakeStats::new(1000, 0),
+    )
+    .await;
+
+    steady.wait_for(2, Duration::from_secs(10)).await;
+    assert_eq!(steady.announces()[0].event(), Some("started"));
+    // Whichever the shuffle asked first, every announce the flaky tracker
+    // ever saw opened with `started`, and it saw at most its one success
+    // plus one refusal.
+    for announce in flaky.announces().iter().take(1) {
+        assert_eq!(announce.event(), Some("started"));
+    }
+    assert!(flaky.count() <= 2, "flaky saw {} announces", flaky.count());
+}
+
+#[tokio::test]
+async fn two_tiers_are_both_announced_to_every_cycle() {
+    let a = FakeTracker::start(|_| Reply::ok(body_empty(1, None))).await;
+    let b = FakeTracker::start(|_| Reply::ok(body_empty(1, None))).await;
+    let running = run_tiers(
+        vec![vec![a.url.clone()], vec![b.url.clone()]],
+        FakeStats::new(1000, 0),
+    )
+    .await;
+
+    a.wait_for(2, Duration::from_secs(10)).await;
+    b.wait_for(2, Duration::from_secs(10)).await;
+    assert_eq!(a.announces()[0].event(), Some("started"));
+    assert_eq!(b.announces()[0].event(), Some("started"));
+
+    let statuses = running.comms.tracker_statuses();
+    let tiers = statuses.iter().map(|s| s.tier).collect::<Vec<_>>();
+    assert_eq!(tiers, vec![0, 1]);
+}
+
+#[tokio::test]
+async fn stopped_goes_to_the_trackers_that_answered_only() {
+    let a = FakeTracker::start(|_| Reply::ok(body_empty(3600, None))).await;
+    let b = FakeTracker::start(|_| Reply::ok(body_empty(3600, None))).await;
+    let running = run_tiers(
+        vec![vec![a.url.clone(), b.url.clone()]],
+        FakeStats::new(1000, 0),
+    )
+    .await;
+
+    wait_for_total(&a, &b, 1, Duration::from_secs(5)).await;
+    running.comms.announce_stopped(Duration::from_secs(3)).await;
+    let (used, standby) = if a.count() > 0 { (&a, &b) } else { (&b, &a) };
+    assert_eq!(used.count(), 2);
+    assert_eq!(used.announces()[1].event(), Some("stopped"));
+    assert_eq!(standby.count(), 0, "a standby tracker was told stopped");
+}
+
+#[tokio::test]
+async fn a_tier_with_no_answer_backs_off_and_keeps_trying_every_tracker() {
+    // Both refuse. The tier retries as a whole, and every tracker of it
+    // stays reported, in Error, with the same next try.
+    let a = FakeTracker::start(|_| Reply::status("503 Service Unavailable")).await;
+    let b = FakeTracker::start(|_| Reply::status("503 Service Unavailable")).await;
+    let running = run_tiers(
+        vec![vec![a.url.clone(), b.url.clone()]],
+        FakeStats::new(1000, 0),
+    )
+    .await;
+
+    wait_for_total(&a, &b, 2, Duration::from_secs(5)).await;
+    let statuses = loop {
+        let statuses = running.comms.tracker_statuses();
+        if statuses
+            .iter()
+            .all(|s| s.state == TrackerState::Error && s.next_announce.is_some())
+        {
+            break statuses;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(statuses[0].next_announce, statuses[1].next_announce);
+}
+
+fn redacted(url: &Url) -> String {
+    crate::redacted_tracker_url(url)
 }
