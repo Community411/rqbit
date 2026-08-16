@@ -300,6 +300,23 @@ impl TorrentStateLive {
             files: paused.files,
             stats: AtomicStats {
                 have_bytes: AtomicU64::new(have_bytes),
+                // The embedder's add-time floor for the announce counters:
+                // what this torrent had already uploaded and downloaded when
+                // it was re-added in place (see AddTorrentOptions).
+                uploaded_bytes: AtomicU64::new(
+                    paused
+                        .shared
+                        .options
+                        .initial_uploaded_bytes
+                        .unwrap_or_default(),
+                ),
+                fetched_bytes: AtomicU64::new(
+                    paused
+                        .shared
+                        .options
+                        .initial_downloaded_bytes
+                        .unwrap_or_default(),
+                ),
                 ..Default::default()
             },
             lengths,

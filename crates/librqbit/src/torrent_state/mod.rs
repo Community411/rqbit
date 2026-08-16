@@ -119,6 +119,12 @@ pub(crate) struct ManagedTorrentOptions {
     pub ratelimits: LimitsConfig,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
+    /// Add-time floor for the session transfer counters (announce `uploaded`
+    /// and `downloaded`). Re-applied on every live transition: the counters
+    /// live on the live state and die with it, and re-seeding the add-time
+    /// floor never over-announces, since it never exceeds what was accounted.
+    pub initial_uploaded_bytes: Option<u64>,
+    pub initial_downloaded_bytes: Option<u64>,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
 }

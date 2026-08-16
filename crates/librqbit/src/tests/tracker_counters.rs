@@ -9,13 +9,16 @@
 //! re-adds a torrent in place can seed the counters at add time so the next
 //! announce continues the accounting instead of restarting it.
 
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use tracing::error_span;
 use tracker_comms::test_support::{FakeTracker, Reply, body_empty};
 
 use crate::{
-    AddTorrent, AddTorrentOptions, ConnectionOptions, Session, SessionOptions, create_torrent,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ConnectionOptions, ListenerMode, Session,
+    SessionOptions, create_torrent,
+    listen::ListenerOptions,
     spawn_utils::BlockingSpawner,
     tests::test_util::{create_default_random_dir_with_torrents, setup_test_logging},
 };
@@ -92,6 +95,103 @@ async fn added_complete_announces_downloaded_zero() {
         assert_eq!(first.downloaded(), 0);
         assert_eq!(first.left(), 0);
         session.stop().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A real transfer announces the bytes fetched from the peer, on top of the
+/// add-time floor `initial_uploaded_bytes` / `initial_downloaded_bytes`
+/// seeds, so a re-added torrent continues its accounting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transfer_announces_fetched_bytes_on_top_of_the_seeded_floor() {
+    setup_test_logging();
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let datadir = create_default_random_dir_with_torrents(1, FILE_LEN, Some("rqbit_ann_"));
+        let torrent_bytes = create_test_torrent(datadir.path()).await;
+        let tracker = FakeTracker::start(|_| Reply::ok(body_empty(3600, None))).await;
+
+        let server_session = Session::new_with_opts(
+            datadir.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                disable_local_service_discovery: true,
+                listen: Some(ListenerOptions {
+                    mode: ListenerMode::TcpOnly,
+                    listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                root_span: Some(error_span!(parent: None, "s", name = "server")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let server_handle = server_session
+            .add_torrent(
+                AddTorrent::TorrentFileBytes(torrent_bytes.clone()),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(datadir.path().to_str().unwrap().to_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        server_handle.wait_until_initialized().await.unwrap();
+        let server_addr = server_session.listen_addr().unwrap();
+
+        let outdir = tempfile::TempDir::with_prefix("rqbit_ann_out").unwrap();
+        let client_session = minimal_session(outdir.path(), "client").await;
+        let response = client_session
+            .add_torrent(
+                AddTorrent::TorrentFileBytes(torrent_bytes),
+                Some(AddTorrentOptions {
+                    initial_peers: Some(vec![server_addr]),
+                    trackers: Some(vec![tracker.url.to_string()]),
+                    initial_uploaded_bytes: Some(1234),
+                    initial_downloaded_bytes: Some(5000),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let client_handle = match response {
+            AddTorrentResponse::Added(_, h) => h,
+            _ => panic!("expected the torrent to be added"),
+        };
+        client_handle.wait_until_completed().await.unwrap();
+
+        // The completion cuts the announce sleep, so the announce that
+        // carries it arrives promptly rather than at the next interval.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let completed = loop {
+            if let Some(a) = tracker.announces().into_iter().find(|a| a.left() == 0) {
+                break a;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no announce with left=0 in time; announces: {:?}",
+                tracker.announces()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        // Every byte of the file was fetched from the peer, and the seeded
+        // floor is announced on top of it, never lost and never doubled.
+        assert_eq!(completed.downloaded(), 5000 + FILE_LEN as u64);
+        assert_eq!(completed.uploaded(), 1234);
+
+        // The first announce of the session already carried the floor.
+        let first = &tracker.announces()[0];
+        assert_eq!(first.event(), Some("started"));
+        assert!(first.downloaded() >= 5000, "was {}", first.downloaded());
+        assert_eq!(first.uploaded(), 1234);
+
+        client_session.stop().await;
+        server_session.stop().await;
     })
     .await
     .unwrap();

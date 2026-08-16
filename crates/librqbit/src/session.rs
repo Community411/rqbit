@@ -291,6 +291,16 @@ pub struct AddTorrentOptions {
     /// This is used to restore the session from serialized state.
     pub preferred_id: Option<usize>,
 
+    /// Seed the per-torrent session counters the tracker announces read, so
+    /// an embedder that re-adds a torrent in place (a tracker URL change, a
+    /// metainfo replacement) can continue its accounting instead of
+    /// restarting the announce from zero and losing the transfer done since
+    /// the last announce. `initial_uploaded_bytes` pre-loads the announce
+    /// `uploaded`, `initial_downloaded_bytes` the announce `downloaded`.
+    /// `None` keeps the counters at zero, the behaviour of a fresh add.
+    pub initial_uploaded_bytes: Option<u64>,
+    pub initial_downloaded_bytes: Option<u64>,
+
     #[serde(skip)]
     pub storage_factory: Option<BoxStorageFactory>,
 
@@ -1372,6 +1382,8 @@ impl Session {
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
+                    initial_uploaded_bytes: opts.initial_uploaded_bytes,
+                    initial_downloaded_bytes: opts.initial_downloaded_bytes,
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },
