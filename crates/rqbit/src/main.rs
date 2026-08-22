@@ -64,7 +64,7 @@ fn parse_umask(value: &str) -> anyhow::Result<libc::mode_t> {
 }
 
 #[derive(Parser)]
-#[command(version, author, about)]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), "+c411"), author, about)]
 struct Opts {
     /// The console loglevel
     #[arg(value_enum, short = 'v', env = "RQBIT_LOG_LEVEL_CONSOLE")]
