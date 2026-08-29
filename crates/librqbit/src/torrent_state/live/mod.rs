@@ -849,6 +849,13 @@ impl TorrentStateLive {
         let hns = pt.update_only_files(&self.metadata.file_infos, only_files)?;
         if !hns.finished() {
             self.reconnect_all_not_needed_peers();
+            // That call reaches the peers this torrent knows, and one that
+            // had everything it wanted knows none: it announced as a seeder,
+            // which a tracker answers with nothing, and a torrent restored
+            // from a session starts there. Widening the selection makes it a
+            // leecher again, so announce now rather than at the next
+            // scheduled announce, which can be half an hour off.
+            self.shared.reannounce();
         }
         Ok(())
     }

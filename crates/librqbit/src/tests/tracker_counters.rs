@@ -9,6 +9,7 @@
 //! re-adds a torrent in place can seed the counters at add time so the next
 //! announce continues the accounting instead of restarting it.
 
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
@@ -192,6 +193,81 @@ async fn a_transfer_announces_fetched_bytes_on_top_of_the_seeded_floor() {
 
         client_session.stop().await;
         server_session.stop().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Widening the file selection of a torrent that already had everything it
+/// wanted announces at once, rather than at the next scheduled announce.
+///
+/// The peer set `update_only_files` reconnects is the one this torrent
+/// knows, and a finished torrent knows nobody: it announced as a seeder,
+/// which a tracker answers with nothing, and one restored from a session
+/// starts exactly there. So the newly selected files have nowhere to come
+/// from until the announce interval expires, half an hour later. The
+/// torrent below therefore holds no peer at all, which is what makes this
+/// test see the announce and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn widening_the_selection_announces_at_once() {
+    setup_test_logging();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let datadir = create_default_random_dir_with_torrents(2, FILE_LEN, Some("rqbit_ann_"));
+        let torrent_bytes = create_test_torrent(datadir.path()).await;
+
+        // The output tree carries the first file whole and nothing of the
+        // second, so the torrent is complete for a selection of [0] and has
+        // real work to do the moment [1] joins it.
+        let outdir = tempfile::TempDir::with_prefix("rqbit_ann_out").unwrap();
+        std::fs::copy(
+            datadir.path().join("0.data"),
+            outdir.path().join("0.data"),
+        )
+        .unwrap();
+
+        // An hour of interval, so nothing but a forced announce can reach
+        // the tracker for the rest of this test.
+        let tracker = FakeTracker::start(|_| Reply::ok(body_empty(3600, None))).await;
+        let session = minimal_session(outdir.path(), "widen").await;
+        let handle = session
+            .add_torrent(
+                AddTorrent::TorrentFileBytes(torrent_bytes),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(outdir.path().to_str().unwrap().to_owned()),
+                    trackers: Some(vec![tracker.url.to_string()]),
+                    only_files: Some(vec![0]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+
+        tracker.wait_for(1, Duration::from_secs(15)).await;
+        let first = &tracker.announces()[0];
+        assert_eq!(first.event(), Some("started"));
+        assert_eq!(first.left(), 0, "the torrent should have started finished");
+        // Long enough that a second announce would have to be forced.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let before = tracker.count();
+
+        session
+            .update_only_files(&handle, &HashSet::from_iter([0usize, 1usize]))
+            .await
+            .unwrap();
+
+        tracker.wait_for(before + 1, Duration::from_secs(15)).await;
+        let last = tracker.announces().pop().unwrap();
+        assert_eq!(
+            last.left(),
+            FILE_LEN as u64,
+            "the announce must carry the newly selected file as left"
+        );
+
+        session.stop().await;
     })
     .await
     .unwrap();
