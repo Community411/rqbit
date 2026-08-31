@@ -5,6 +5,8 @@ pub mod stats;
 mod streaming;
 pub mod utils;
 
+pub(crate) use streaming::env_flag;
+
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -701,6 +703,30 @@ impl ManagedTorrent {
 
         g.only_files = Some(only_files.iter().copied().collect());
         Ok(())
+    }
+}
+
+/// Put every non-padding file under the name its state calls for: a complete
+/// one at its final name, an incomplete one at its `.part` name. A refusal
+/// (the destination exists, a foreign handle on Windows) is logged and left
+/// for a later reconcile.
+pub(crate) fn reconcile_file_names(
+    files: &dyn crate::storage::TorrentStorage,
+    chunks: &crate::chunk_tracker::ChunkTracker,
+    file_infos: &[crate::file_info::FileInfo],
+) {
+    for (idx, fi) in file_infos.iter().enumerate() {
+        if fi.attrs.padding {
+            continue;
+        }
+        let res = if chunks.is_file_finished(fi) {
+            files.on_file_complete(idx, &fi.relative_filename)
+        } else {
+            files.on_file_incomplete(idx, &fi.relative_filename)
+        };
+        if let Err(e) = res {
+            tracing::warn!(file = ?fi.relative_filename, "error renaming file for its state: {e:#}");
+        }
     }
 }
 

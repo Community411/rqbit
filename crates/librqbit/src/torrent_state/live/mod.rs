@@ -857,6 +857,12 @@ impl TorrentStateLive {
             // scheduled announce, which can be half an hour off.
             self.shared.reannounce();
         }
+        // A widened selection can prove a file complete with no piece ever
+        // completing (its bytes rode pieces shared with a selected file, or
+        // its promote was refused earlier): reconcile now rather than at
+        // the next restart.
+        let chunks = g.get_chunks()?;
+        crate::torrent_state::reconcile_file_names(&*self.files, chunks, &self.metadata.file_infos);
         Ok(())
     }
 
@@ -892,7 +898,13 @@ impl TorrentStateLive {
         let locked = &mut **g;
         let pieces = locked.get_pieces_mut()?;
 
-        // if we have all the pieces of the file, reopen it read only
+        // A file whose last bytes just landed moves to its final name here,
+        // under the same lock stats() reads file_progress from: a poll that
+        // sees a file's progress at its full length sees it after the rename
+        // attempt. The torrent-level `finished` flag rides hns, published
+        // under a lock scope the piece-download task released just before
+        // calling in here, so `finished` alone can precede the rename by a
+        // beat.
         for (idx, file_info) in self
             .metadata
             .file_infos
@@ -901,7 +913,20 @@ impl TorrentStateLive {
             .skip_while(|(_, fi)| !fi.piece_range.contains(&id.get()))
             .take_while(|(_, fi)| fi.piece_range.contains(&id.get()))
         {
-            let _remaining = pieces.update_file_have_on_piece_completed(id, idx, file_info);
+            let remaining = pieces.update_file_have_on_piece_completed(id, idx, file_info);
+            if remaining == 0
+                && !file_info.attrs.padding
+                && let Err(e) = self
+                    .files
+                    .on_file_complete(idx, &file_info.relative_filename)
+            {
+                warn!(
+                    id = self.shared.id,
+                    info_hash = ?self.shared.info_hash,
+                    file = ?file_info.relative_filename,
+                    "error completing file: {e:#}"
+                );
+            }
         }
 
         self.streams
@@ -914,6 +939,13 @@ impl TorrentStateLive {
 
         let chunks = locked.get_chunks()?;
         if chunks.is_finished() {
+            // A rename refused earlier (a foreign handle on Windows) gets
+            // another try at the finish rather than at the next restart.
+            crate::torrent_state::reconcile_file_names(
+                &*self.files,
+                chunks,
+                &self.metadata.file_infos,
+            );
             if chunks.get_selected_pieces()[id.get_usize()] {
                 locked.try_flush_bitv(&self.shared, false);
                 info!(id=self.shared.id, info_hash=?self.shared.info_hash, "torrent finished downloading");

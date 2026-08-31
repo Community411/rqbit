@@ -94,6 +94,14 @@ impl<U: TorrentStorage> TorrentStorage for TimingStorage<U> {
         self.underlying.remove_file(file_id, filename)
     }
 
+    fn on_file_complete(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.underlying.on_file_complete(file_id, filename)
+    }
+
+    fn on_file_incomplete(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
+        self.underlying.on_file_incomplete(file_id, filename)
+    }
+
     fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
         self.underlying.ensure_file_length(file_id, length)
     }

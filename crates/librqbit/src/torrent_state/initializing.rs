@@ -261,6 +261,15 @@ impl TorrentStateInitializing {
         self.shared
             .spawner
             .block_in_place_with_semaphore(|| {
+                // Every file, selected or not, lands under the name its
+                // state calls for. This is the crash recovery, the retry
+                // of a rename refused earlier, and the migration of data
+                // written before the rule existed.
+                super::reconcile_file_names(
+                    &*self.files,
+                    &chunk_tracker,
+                    &self.metadata.file_infos,
+                );
                 for (idx, fi) in self.metadata.file_infos.iter().enumerate() {
                     if self
                         .only_files

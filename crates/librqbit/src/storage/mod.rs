@@ -168,6 +168,19 @@ pub trait TorrentStorage: Send + Sync {
     fn on_piece_completed(&self, _piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Called when every piece of a file is downloaded and validated: once
+    /// when the last one lands, and at startup for a file the check found
+    /// complete. Default implementation does nothing.
+    fn on_file_complete(&self, _file_id: usize, _filename: &Path) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Called at startup for a file the check found incomplete. Default
+    /// implementation does nothing.
+    fn on_file_incomplete(&self, _file_id: usize, _filename: &Path) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
@@ -205,5 +218,13 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_completed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
         (**self).on_piece_completed(piece_id)
+    }
+
+    fn on_file_complete(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
+        (**self).on_file_complete(file_id, filename)
+    }
+
+    fn on_file_incomplete(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
+        (**self).on_file_incomplete(file_id, filename)
     }
 }

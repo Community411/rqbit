@@ -78,6 +78,14 @@ impl TorrentStorage for MmapFilesystemStorage {
         self.fs.remove_file(file_id, filename)
     }
 
+    fn on_file_complete(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
+        self.fs.on_file_complete(file_id, filename)
+    }
+
+    fn on_file_incomplete(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
+        self.fs.on_file_incomplete(file_id, filename)
+    }
+
     fn remove_directory_if_empty(&self, path: &Path) -> anyhow::Result<()> {
         self.fs.remove_directory_if_empty(path)
     }

@@ -29,7 +29,7 @@ type StreamId = usize;
 // 32 mb lookahead by default, overridable with RQBIT_STREAM_LOOKAHEAD_MB.
 const PER_STREAM_BUF_DEFAULT: u64 = 32 * 1024 * 1024;
 
-fn env_flag(name: &str, default: bool) -> bool {
+pub(crate) fn env_flag(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(v) => !matches!(v.trim(), "0" | "false" | "no" | ""),
         Err(_) => default,

@@ -2,7 +2,7 @@ use std::{
     fs::File,
     io::IoSlice,
     ops::{Deref, DerefMut},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::Context;
@@ -108,11 +108,48 @@ impl OurFileExt for File {
 
 #[derive(Default, Debug)]
 struct OpenedFileLocked {
-    #[allow(unused)]
-    path: PathBuf,
+    final_path: PathBuf,
+    part_path: PathBuf,
+    at_part: bool,
     fd: Option<File>,
     #[cfg(windows)]
     tried_marking_sparse: bool,
+}
+
+impl OpenedFileLocked {
+    fn path(&self) -> &Path {
+        if self.at_part {
+            &self.part_path
+        } else {
+            &self.final_path
+        }
+    }
+
+    // The fd is left alone on purpose: every read and write goes through it,
+    // and it follows the inode across the rename. On Windows std opens with
+    // FILE_SHARE_DELETE, which is what admits a rename under an open handle.
+    fn rename(&mut self, to_part: bool) -> anyhow::Result<()> {
+        if self.fd.is_none() || self.at_part == to_part || self.final_path == self.part_path {
+            return Ok(());
+        }
+        let from = self.path().to_path_buf();
+        let to = if to_part {
+            &self.part_path
+        } else {
+            &self.final_path
+        };
+        // Whatever sits at the destination may hold data (a stale .part
+        // beside an adopted final name, a file someone put at the final
+        // name), and std::fs::rename replaces it on both platforms: refuse
+        // instead. The callers log the refusal, and every later reconcile
+        // retries it.
+        if to.try_exists()? {
+            anyhow::bail!("not renaming {from:?} over {to:?}, which exists");
+        }
+        std::fs::rename(&from, to).with_context(|| format!("error renaming {from:?} to {to:?}"))?;
+        self.at_part = to_part;
+        Ok(())
+    }
 }
 
 impl Deref for OpenedFileLocked {
@@ -135,15 +172,38 @@ pub(crate) struct OpenedFile {
 }
 
 impl OpenedFile {
-    pub fn new(path: PathBuf, f: File) -> Self {
+    pub fn new(final_path: PathBuf, part_path: PathBuf, at_part: bool, f: File) -> Self {
         Self {
             file: RwLock::new(OpenedFileLocked {
-                path,
+                final_path,
+                part_path,
+                at_part,
                 fd: Some(f),
                 #[cfg(windows)]
                 tried_marking_sparse: false,
             }),
         }
+    }
+
+    /// Move the file to its final name. A no-op for a padding dummy, for a
+    /// taken file and for a file already there.
+    pub fn promote(&self) -> anyhow::Result<()> {
+        self.file.write().rename(false)
+    }
+
+    /// Move the file to its `.part` name. Same no-ops as `promote`.
+    pub fn demote(&self) -> anyhow::Result<()> {
+        self.file.write().rename(true)
+    }
+
+    /// The path the file sits at now: None for a padding dummy and for a
+    /// file whose handles were taken.
+    pub fn current_path_if_any(&self) -> Option<PathBuf> {
+        let g = self.file.read();
+        if g.final_path.as_os_str().is_empty() {
+            return None;
+        }
+        Some(g.path().to_path_buf())
     }
 
     pub fn new_dummy() -> Self {
@@ -186,7 +246,7 @@ impl OpenedFile {
         if !g.tried_marking_sparse {
             g.tried_marking_sparse = true;
             let f = g.fd.as_ref().ok_or(Error::FsFileIsNone)?;
-            tracing::debug!(path=?g.path, marked=super::sparse::mark_file_sparse(f), "marking sparse");
+            tracing::debug!(path=?g.path(), marked=super::sparse::mark_file_sparse(f), "marking sparse");
         }
         let g = parking_lot::RwLockWriteGuard::downgrade(g);
         Ok(RwLockReadGuard::try_map(g, |f| f.fd.as_ref()).ok().unwrap())
